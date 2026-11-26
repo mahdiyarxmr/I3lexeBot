@@ -1,0 +1,1118 @@
+import os
+import random
+import sqlite3
+import html
+import logging
+import copy
+import re
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters,
+)
+
+OWNER_ID = 6341879634
+BOT_NAME = "i3l.exe"
+DB_NAME = "i3l.db"
+AUTO_EDIT_EVERY = 200
+logging.basicConfig(level=logging.INFO)
+
+# Premium custom emoji IDs supplied by the owner.
+EMOJI = {
+    "brand": 4956770345555068016,
+    "brand2": 4956358131773867289,
+    "brand3": 4956698533701878973,
+    "profile": 4938653911507534983,
+    "admin": 5406711411541823609,
+    "vip": 5253912783140960304,
+    "owner": 5323261373801571717,
+    "edit": 5924623057997007830,
+    "music": 5190785418248876370,
+    "photo": 5375074927252621134,
+    "rank": 5409008750893734809,
+    "help": 5226512880362332956,
+    "like": 5255965021594203933,
+    "dislike": 5377627447791466788,
+    "approve": 5904704361182798355,
+    "reject": 5161208387957950108,
+    "stats": 5203993413346680064,
+    "upload": 5318974936310627698,
+    "delete": 6050913161131859293,
+    "back": 6050826230993787980,
+}
+
+
+def e(key):
+    eid = EMOJI.get(key)
+    # Telegram requires a valid fallback character inside tg-emoji.
+    return f'<tg-emoji emoji-id="{eid}">⭐</tg-emoji>' if eid else ""
+
+
+def safe(value):
+    return html.escape(str(value or "—"))
+
+
+def btn(text, callback, icon="brand", style="primary"):
+    kwargs = {"text": text, "callback_data": callback, "style": style}
+    if EMOJI.get(icon):
+        kwargs["icon_custom_emoji_id"] = str(EMOJI[icon])
+    return InlineKeyboardButton(**kwargs)
+
+
+db = sqlite3.connect(DB_NAME, check_same_thread=False)
+db.execute("PRAGMA foreign_keys=ON")
+db.executescript("""
+CREATE TABLE IF NOT EXISTS media (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    sender_id INTEGER NOT NULL,
+    username TEXT,
+    approved INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS votes (
+    media_id INTEGER,
+    voter_id INTEGER,
+    vote INTEGER,
+    UNIQUE(media_id, voter_id)
+);
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    bio TEXT DEFAULT '',
+    color TEXT DEFAULT 'blue',
+    role TEXT DEFAULT 'Member',
+    profile_photo_id TEXT,
+    joined_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    show_creator INTEGER DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS group_counts (
+    chat_id INTEGER PRIMARY KEY,
+    message_count INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS group_chats (
+    chat_id INTEGER PRIMARY KEY,
+    title TEXT,
+    chat_type TEXT,
+    active INTEGER DEFAULT 1,
+    added_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+""")
+
+# Safe migrations for databases created by older versions.
+def add_column_if_missing(table, column, definition):
+    cols = {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+add_column_if_missing("media", "created_at", "TEXT")
+add_column_if_missing("users", "profile_photo_id", "TEXT")
+add_column_if_missing("users", "show_creator", "INTEGER DEFAULT 1")
+add_column_if_missing("users", "character", "TEXT DEFAULT 'None'")
+db.commit()
+
+
+def ensure_user(user):
+    is_owner = user.id == OWNER_ID
+    role = "Owner" if is_owner else "Member"
+    color = "Owner" if is_owner else "blue"
+    db.execute(
+        "INSERT INTO users(user_id,username,first_name,role,color) VALUES(?,?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, "
+        "first_name=excluded.first_name, "
+        "role=CASE WHEN users.user_id=? THEN 'Owner' ELSE users.role END, "
+        "color=CASE WHEN users.user_id=? THEN 'Owner' ELSE users.color END",
+        (user.id, user.username, user.first_name, role, color, OWNER_ID, OWNER_ID),
+    )
+    db.commit()
+
+
+def media_rows(kinds, approved=1):
+    marks = ",".join("?" for _ in kinds)
+    return db.execute(
+        f"SELECT id,file_id,kind,sender_id,username FROM media "
+        f"WHERE kind IN ({marks}) AND approved=?",
+        (*kinds, approved),
+    ).fetchall()
+
+
+def vote_counts(media_id):
+    row = db.execute(
+        "SELECT SUM(CASE WHEN vote=1 THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN vote=-1 THEN 1 ELSE 0 END) FROM votes WHERE media_id=?",
+        (media_id,),
+    ).fetchone()
+    return row[0] or 0, row[1] or 0
+
+
+def vote_buttons(media_id):
+    up, down = vote_counts(media_id)
+    return InlineKeyboardMarkup([[
+        btn(str(up), f"vote:{media_id}:1", "like", "success"),
+        btn(str(down), f"vote:{media_id}:-1", "dislike", "danger"),
+    ]])
+
+
+def review_buttons(media_id):
+    return InlineKeyboardMarkup([[
+        btn("تأیید", f"review:{media_id}:1", "approve", "success"),
+        btn("رد", f"review:{media_id}:0", "reject", "danger"),
+    ]])
+
+
+def main_menu(is_owner=False, is_admin=False):
+    rows = [
+        [btn("پروفایل من", "menu:profile", "profile"), btn("ادیت", "menu:edit", "edit")],
+        [btn("موزیک", "menu:music", "music"), btn("گالری عکس", "menu:photo", "photo")],
+        [btn("رنک", "menu:ranks", "rank"), btn("آمار", "menu:stats", "stats")],
+        [btn("راهنما", "menu:help", "help"), btn("بستن", "menu:close", "delete", "danger")],
+    ]
+    if is_owner or is_admin:
+        rows.insert(3, [btn("پنل مدیریت", "admin:panel", "admin", "success")])
+    return InlineKeyboardMarkup(rows)
+
+
+def profile_keyboard(user_id, own=False):
+    rows = []
+    if own:
+        rows.append([
+            btn("تنظیم عکس", f"profile:photo:{user_id}", "photo"),
+            btn("تنظیم بیو", f"profile:bio:{user_id}", "profile"),
+        ])
+    rows.append([btn("نمایش سازنده: روشن/خاموش", f"profile:creator:{user_id}", "profile")])
+    rows.append([
+        btn("برگشت", "menu:home", "back"),
+        btn("بستن", "menu:close", "delete", "danger"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def profile_text(user_id):
+    row = db.execute(
+        "SELECT username,first_name,bio,role,show_creator,character FROM users WHERE user_id=?",
+        (user_id,),
+    ).fetchone()
+    if not row:
+        return None
+    username, first, bio, role, show_creator, character = row
+    edits = db.execute(
+        "SELECT COUNT(*) FROM media WHERE sender_id=? AND kind='video' AND approved=1", (user_id,)
+    ).fetchone()[0]
+    musics = db.execute(
+        "SELECT COUNT(*) FROM media WHERE sender_id=? AND kind IN ('audio','document_audio') AND approved=1",
+        (user_id,),
+    ).fetchone()[0]
+    photos = db.execute(
+        "SELECT COUNT(*) FROM media WHERE sender_id=? AND kind='photo' AND approved=1", (user_id,)
+    ).fetchone()[0]
+    likes = db.execute(
+        "SELECT COUNT(*) FROM votes v JOIN media m ON m.id=v.media_id "
+        "WHERE m.sender_id=? AND m.approved=1 AND v.vote=1", (user_id,),
+    ).fetchone()[0]
+    dislikes = db.execute(
+        "SELECT COUNT(*) FROM votes v JOIN media m ON m.id=v.media_id "
+        "WHERE m.sender_id=? AND m.approved=1 AND v.vote=-1", (user_id,),
+    ).fetchone()[0]
+    score = edits + musics + photos + likes
+    level = max(1, score // 10 + 1)
+    progress = score % 10
+    remaining = 10 - progress if progress else 10
+    bar = "█" * progress + "░" * (10 - progress)
+    total_votes = likes + dislikes
+    rating = (likes / total_votes * 10) if total_votes else None
+    rating_text = f"{rating:.1f}/10" if rating is not None else "بدون رأی"
+    ranked = []
+    for (uid,) in db.execute("SELECT user_id FROM users").fetchall():
+        uploads = db.execute(
+            "SELECT COUNT(*) FROM media WHERE sender_id=? AND approved=1", (uid,)
+        ).fetchone()[0]
+        user_likes = db.execute(
+            "SELECT COUNT(*) FROM votes v JOIN media m ON m.id=v.media_id "
+            "WHERE m.sender_id=? AND v.vote=1", (uid,),
+        ).fetchone()[0]
+        ranked.append((uid, uploads + user_likes))
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    rank = next((i for i, (uid, _) in enumerate(ranked, 1) if uid == user_id), len(ranked) + 1)
+    role_icon = "owner" if role == "Owner" else "admin" if role == "Admin" else "vip" if role == "VIP" else "profile"
+    name = ("@" + username) if username else (first or "کاربر")
+    bio_line = f"\n\n<b>درباره من:</b> {safe(bio)}" if bio else ""
+    return (
+        f"{e('brand')} {e('brand2')} {e('brand3')} <b>پروفایل کاربر</b>\n\n"
+        f"نام کاربری: <b>{safe(name)}</b>\nشناسه: <code>{user_id}</code>\n"
+        f"مقام: {e(role_icon)} <b>{safe(role)}</b>\nسطح: <b>{level}</b>  ·  رتبه: <b>#{rank}</b>\n"
+        f"کرکتر: <b>{safe(character or 'None')}</b>{bio_line}\n"
+        f"پیشرفت لول: <code>{bar}</code>  <b>{progress}/10</b>\n"
+        f"{remaining} امتیاز تا لول بعدی\n"
+        f"نمایش سازنده زیر محتوا: <b>{'روشن' if show_creator else 'خاموش'}</b>\n\n"
+        f"{e('edit')} ادیت: <b>{edits}</b>\n{e('music')} موزیک: <b>{musics}</b>\n"
+        f"{e('photo')} عکس: <b>{photos}</b>\n"
+        f"{e('like')} لایک: <b>{likes}</b>  {e('dislike')} دیسلایک: <b>{dislikes}</b>\n"
+        f"{e('stats')} ریتینگ: <b>{rating_text}</b>"
+    )
+
+
+def save_media(file_id, kind, user, approved):
+    ensure_user(user)
+    cur = db.execute(
+        "INSERT INTO media(file_id,kind,sender_id,username,approved,created_at) "
+        "VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)",
+        (file_id, kind, user.id, user.username or user.first_name or "کاربر", approved),
+    )
+    db.commit()
+    return cur.lastrowid
+
+
+async def send_media(chat_id, file_id, kind, caption, markup, context):
+    kwargs = {
+        "chat_id": chat_id,
+        "caption": caption,
+        "parse_mode": ParseMode.HTML,
+        "reply_markup": markup,
+    }
+    if kind == "video":
+        return await context.bot.send_video(video=file_id, **kwargs)
+    if kind == "audio":
+        return await context.bot.send_audio(audio=file_id, **kwargs)
+    if kind == "document_audio":
+        return await context.bot.send_document(document=file_id, **kwargs)
+    if kind == "photo":
+        return await context.bot.send_photo(photo=file_id, **kwargs)
+
+
+async def receive_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, user = update.message, update.effective_user
+    if msg.photo and context.user_data.pop("await_profile_photo", False):
+        photo_id = msg.photo[-1].file_id
+        db.execute("UPDATE users SET profile_photo_id=? WHERE user_id=?", (photo_id, user.id))
+        db.commit()
+        await msg.reply_text("عکس پروفایل ذخیره شد.")
+        return
+    if msg.video:
+        file_id, kind = msg.video.file_id, "video"
+    elif msg.audio:
+        file_id, kind = msg.audio.file_id, "audio"
+    elif msg.photo:
+        file_id, kind = msg.photo[-1].file_id, "photo"
+    elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("audio/"):
+        file_id, kind = msg.document.file_id, "document_audio"
+    else:
+        return
+    approved = 1 if user.id == OWNER_ID else 0
+    media_id = save_media(file_id, kind, user, approved)
+    if approved:
+        await msg.reply_text(f"{e('approve')} ذخیره شد و وارد آرشیو شد.", parse_mode=ParseMode.HTML)
+        return
+    await msg.reply_text(f"{e('upload')} محتوای شما برای تأیید ارسال شد.", parse_mode=ParseMode.HTML)
+    label = {"video": "ادیت", "photo": "عکس", "audio": "موزیک", "document_audio": "موزیک"}[kind]
+    caption = (
+        f"{e('upload')} <b>محتوای جدید</b>\n"
+        f"فرستنده: {safe('@' + user.username if user.username else user.first_name)}\n"
+        f"شناسه: <code>{user.id}</code>\nنوع: {label}"
+    )
+    # Send the moderation request to the owner and every registered Admin.
+    admin_ids = [row[0] for row in db.execute(
+        "SELECT user_id FROM users WHERE role='Admin'"
+    ).fetchall()]
+    reviewer_ids = list(dict.fromkeys([OWNER_ID, *admin_ids]))
+    delivered = 0
+    for reviewer_id in reviewer_ids:
+        try:
+            await send_media(
+                reviewer_id, file_id, kind, caption, review_buttons(media_id), context
+            )
+            delivered += 1
+        except Exception as exc:
+            logging.warning("Could not send moderation item %s to reviewer %s: %s",
+                            media_id, reviewer_id, exc)
+    if delivered == 0:
+        logging.error("No reviewer received moderation item %s", media_id)
+
+
+async def review_callback(update, context):
+    q = update.callback_query
+    reviewer = db.execute(
+        "SELECT role FROM users WHERE user_id=?", (q.from_user.id,)
+    ).fetchone()
+    if q.from_user.id != OWNER_ID and (not reviewer or reviewer[0] != "Admin"):
+        await q.answer("اجازه دسترسی نداری.", show_alert=True)
+        return
+
+    try:
+        _, mid, decision = q.data.split(":")
+        mid, decision = int(mid), int(decision)
+        if decision not in (0, 1):
+            await q.answer("درخواست نامعتبر است.", show_alert=True)
+            return
+    except (ValueError, AttributeError):
+        await q.answer("درخواست نامعتبر است.", show_alert=True)
+        return
+
+    item = db.execute(
+        "SELECT sender_id FROM media WHERE id=? AND approved=0", (mid,)
+    ).fetchone()
+    if not item:
+        await q.answer("این محتوا قبلاً بررسی شده.")
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    # Acknowledge the button immediately so Telegram does not leave it loading
+    # while the bot sends notifications or edits the moderation message.
+    await q.answer("در حال بررسی...")
+    sender = item[0]
+    if decision:
+        cur = db.execute(
+            "UPDATE media SET approved=1 WHERE id=? AND approved=0", (mid,)
+        )
+        result = f"{e('approve')} محتوای شما تأیید شد."
+        status = "تأیید شد."
+    else:
+        cur = db.execute(
+            "DELETE FROM media WHERE id=? AND approved=0", (mid,)
+        )
+        if cur.rowcount:
+            db.execute("DELETE FROM votes WHERE media_id=?", (mid,))
+        result = f"{e('reject')} محتوای شما رد شد."
+        status = "رد شد."
+
+    if not cur.rowcount:
+        db.commit()
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    db.commit()
+
+    reviewer_name = "@" + q.from_user.username if q.from_user.username else q.from_user.full_name
+    handled_line = f"\n\nرسیدگی توسط: {reviewer_name} · شناسه: {q.from_user.id}"
+    try:
+        if q.message and q.message.caption is not None:
+            await q.edit_message_caption(
+                caption=(q.message.caption or "") + handled_line,
+                caption_entities=q.message.caption_entities,
+                reply_markup=None,
+            )
+        elif q.message:
+            await q.edit_message_text(
+                (q.message.text or "") + handled_line,
+                entities=q.message.entities,
+                reply_markup=None,
+            )
+    except Exception as exc:
+        logging.warning("Could not update review message %s: %s", mid, exc)
+
+    try:
+        await context.bot.send_message(sender, result, parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        logging.info("Could not notify sender %s about media %s: %s", sender, mid, exc)
+
+
+async def send_random(update, context, kinds, label, key):
+    items = media_rows(kinds)
+    if not items:
+        await update.effective_message.reply_text(
+            f"{e(key)} هنوز محتوایی در آرشیو نیست.", parse_mode=ParseMode.HTML
+        )
+        return
+    mid, file_id, kind, sender, username = random.choice(items)
+    row = db.execute("SELECT role,show_creator FROM users WHERE user_id=?", (sender,)).fetchone()
+    role, show_creator = row if row else ("Member", 1)
+    caption = f"{e(key)} <b>{label}</b>"
+    if show_creator:
+        uname = ("@" + username) if username and not username.startswith("@") else username
+        role_icon = "owner" if role == "Owner" else "admin" if role == "Admin" else "vip" if role == "VIP" else "profile"
+        caption += (
+            f"\nسازنده: <a href=\"tg://user?id={sender}\">{safe(uname)}</a> "
+            f"{e(role_icon)} <b>{safe(role)}</b>"
+        )
+    await send_media(update.effective_chat.id, file_id, kind, caption, vote_buttons(mid), context)
+
+
+async def random_video(update, context):
+    await send_random(update, context, ("video",), "ادیت", "edit")
+
+
+async def random_music(update, context):
+    await send_random(update, context, ("audio", "document_audio"), "موزیک", "music")
+
+
+async def random_photo(update, context):
+    await send_random(update, context, ("photo",), "عکس", "photo")
+
+
+async def vote_callback(update, context):
+    q = update.callback_query
+    _, mid, vote = q.data.split(":")
+    mid, vote = int(mid), int(vote)
+    item = db.execute("SELECT sender_id FROM media WHERE id=? AND approved=1", (mid,)).fetchone()
+    if not item:
+        await q.answer("محتوا در دسترس نیست.")
+        return
+    if item[0] == q.from_user.id and q.from_user.id != OWNER_ID:
+        await q.answer("نمی‌توانی به محتوای خودت رأی بدهی.", show_alert=True)
+        return
+    db.execute(
+        "INSERT INTO votes(media_id,voter_id,vote) VALUES(?,?,?) "
+        "ON CONFLICT(media_id,voter_id) DO UPDATE SET vote=excluded.vote",
+        (mid, q.from_user.id, vote),
+    )
+    db.commit()
+    await q.answer("رأی ثبت شد.")
+    await q.edit_message_reply_markup(reply_markup=vote_buttons(mid))
+
+
+def ranking_text(kind):
+    kinds = {
+        "edit": ("video",),
+        "music": ("audio", "document_audio"),
+        "photo": ("photo",),
+        "all": ("video", "audio", "document_audio", "photo"),
+    }[kind]
+    marks = ",".join("?" for _ in kinds)
+    rows = db.execute(
+        f"SELECT sender_id,MAX(username),COUNT(*) FROM media "
+        f"WHERE kind IN ({marks}) AND approved=1 GROUP BY sender_id", kinds,
+    ).fetchall()
+    stats = []
+    for uid, username, count in rows:
+        mids = [r[0] for r in db.execute(
+            f"SELECT id FROM media WHERE sender_id=? AND kind IN ({marks}) AND approved=1",
+            (uid, *kinds),
+        ).fetchall()]
+        likes = dislikes = 0
+        for mid in mids:
+            up, down = vote_counts(mid)
+            likes += up
+            dislikes += down
+        stats.append((uid, username or str(uid), count, likes, dislikes))
+    stats.sort(key=lambda item: (item[3], item[2]), reverse=True)
+    title = {
+        "edit": "رتبه‌بندی ادیتورها",
+        "music": "رتبه‌بندی موزیک‌فرست‌ها",
+        "photo": "رتبه‌بندی عکاس‌ها",
+        "all": "رتبه‌بندی کلی",
+    }[kind]
+    if not stats:
+        return f"{e('rank')} <b>{title}</b>\n\nهنوز داده‌ای ثبت نشده."
+    out = f"{e('rank')} <b>{title}</b>\n\n"
+    for place, (uid, name, count, likes, dislikes) in enumerate(stats[:10], 1):
+        shown_name = name if str(name).startswith("@") else "@" + str(name)
+        out += (
+            f"<b>#{place}</b> <a href=\"tg://user?id={uid}\">{safe(shown_name)}</a>\n"
+            f"محتوا: {count} | {e('like')} {likes} | {e('dislike')} {dislikes}\n\n"
+        )
+    return out
+
+
+def top_users_text():
+    rows = db.execute(
+        "SELECT sender_id,MAX(username),COUNT(*) FROM media WHERE approved=1 GROUP BY sender_id"
+    ).fetchall()
+    scored = []
+    for uid, username, uploads in rows:
+        likes = db.execute(
+            "SELECT COUNT(*) FROM votes v JOIN media m ON m.id=v.media_id "
+            "WHERE m.sender_id=? AND v.vote=1", (uid,),
+        ).fetchone()[0]
+        scored.append((uid, username or str(uid), uploads, likes, uploads + likes))
+    scored.sort(key=lambda item: (item[4], item[3], item[2]), reverse=True)
+    out = f"{e('brand')} {e('rank')} <b>برترین کاربران i3l.exe</b>\n\n"
+    if not scored:
+        return out + "هنوز فعالیتی برای رتبه‌بندی ثبت نشده."
+    for place, (uid, username, uploads, likes, score) in enumerate(scored[:3], 1):
+        name = username if str(username).startswith("@") else "@" + str(username)
+        role_row = db.execute("SELECT role FROM users WHERE user_id=?", (uid,)).fetchone()
+        role = role_row[0] if role_row else "Member"
+        role_icon = "owner" if role == "Owner" else "admin" if role == "Admin" else "vip" if role == "VIP" else "profile"
+        out += (
+            f"<b>#{place}</b> <a href=\"tg://user?id={uid}\">{safe(name)}</a> {e(role_icon)}\n"
+            f"محتوا: <b>{uploads}</b> · لایک: <b>{likes}</b> · امتیاز: <b>{score}</b>\n\n"
+        )
+    return out
+
+
+def top_media_text(kind):
+    kinds = {
+        "video": ("video", "ویدیوهای برتر", "edit"),
+        "photo": ("photo", "عکس‌های برتر", "photo"),
+        "music": ("audio", "موزیک‌های برتر", "music"),
+    }
+    db_kind, title, icon = kinds[kind]
+    if kind == "music":
+        rows = db.execute(
+            "SELECT id,file_id,kind,sender_id,username FROM media "
+            "WHERE kind IN ('audio','document_audio') AND approved=1"
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT id,file_id,kind,sender_id,username FROM media WHERE kind=? AND approved=1",
+            (db_kind,),
+        ).fetchall()
+    scored = []
+    for item in rows:
+        mid = item[0]
+        likes, dislikes = vote_counts(mid)
+        scored.append((likes - dislikes, likes, item))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    out = f"{e(icon)} <b>{title} | منتخب i3l.exe</b>\n\n"
+    if not scored:
+        return out + "هنوز محتوایی در این بخش ثبت نشده."
+    for place, (_, likes, item) in enumerate(scored[:3], 1):
+        mid, _, _, sender, username = item
+        name = ("@" + username) if username and not username.startswith("@") else (username or str(sender))
+        out += f"<b>#{place}</b> {safe(name)} · {e('like')} {likes} · شناسه محتوا: <code>{mid}</code>\n"
+    return out
+
+
+def rank_menu():
+    return InlineKeyboardMarkup([
+        [btn("رنک ادیت", "rank:edit", "edit"), btn("رنک موزیک", "rank:music", "music")],
+        [btn("رنک عکس", "rank:photo", "photo"), btn("رنک کلی", "rank:all", "rank")],
+        [btn("برترین کاربران", "rank:tops", "owner", "success")],
+        [btn("برترین محتوا", "rank:content", "approve", "success")],
+        [btn("برگشت", "menu:home", "back"), btn("بستن", "menu:close", "delete", "danger")],
+    ])
+
+
+def top_content_menu():
+    return InlineKeyboardMarkup([
+        [btn("۳ ویدیوی برتر", "top:video", "edit")],
+        [btn("۳ عکس برتر", "top:photo", "photo")],
+        [btn("۳ موزیک برتر", "top:music", "music")],
+        [btn("برگشت", "menu:ranks", "back"), btn("بستن", "menu:close", "delete", "danger")],
+    ])
+
+
+async def ranking(update, context):
+    await update.effective_message.reply_text(
+        f"{e('rank')} <b>مرکز رتبه‌بندی i3l.exe</b>\nبخش موردنظرت رو انتخاب کن:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=rank_menu(),
+    )
+
+
+async def profile_command(update, context):
+    target = update.effective_user
+    if update.effective_message.reply_to_message and update.effective_message.reply_to_message.from_user:
+        target = update.effective_message.reply_to_message.from_user
+    ensure_user(target)
+    own = target.id == update.effective_user.id
+    photo_row = db.execute("SELECT profile_photo_id FROM users WHERE user_id=?", (target.id,)).fetchone()
+    photo = photo_row[0] if photo_row else None
+    if photo:
+        await update.effective_message.reply_photo(
+            photo, caption=profile_text(target.id), parse_mode=ParseMode.HTML,
+            reply_markup=profile_keyboard(target.id, own),
+        )
+    else:
+        await update.effective_message.reply_text(
+            profile_text(target.id), parse_mode=ParseMode.HTML,
+            reply_markup=profile_keyboard(target.id, own),
+        )
+
+
+async def start(update, context):
+    ensure_user(update.effective_user)
+    txt = (
+        f"{e('brand')} {e('brand2')} {e('brand3')} <b>به i3l.exe خوش اومدی</b>\n\n"
+        "اینجا آرشیو ادیت، موزیک و عکس همراه با پروفایل و سیستم رتبه‌بندی در دسترسه. "
+        "از منوی لمسی زیر بخش موردنظرت رو انتخاب کن. برای ثبت محتوا، فایل رو در گفت‌وگوی خصوصی بات بفرست تا بررسی بشه."
+    )
+    await update.effective_message.reply_text(
+        txt, parse_mode=ParseMode.HTML,
+        reply_markup=main_menu(update.effective_user.id == OWNER_ID, db.execute("SELECT role FROM users WHERE user_id=?", (update.effective_user.id,)).fetchone()[0] == "Admin"),
+    )
+
+
+def help_text():
+    return (
+        f"{e('brand')} {e('help')} <b>راهنمای رسمی i3l.exe</b>\n\n"
+        f"{e('edit')} <b>ادیت</b> — دریافت ادیت تصادفی از آرشیو تأییدشده\n"
+        f"{e('music')} <b>موزیک</b> — دریافت موزیک تصادفی\n"
+        f"{e('photo')} <b>عکس</b> — دریافت عکس تصادفی\n"
+        f"{e('profile')} <b>پروفایل</b> — مشاهده پروفایل؛ برای دیدن پروفایل دیگران روی پیامشان ریپلای کن\n"
+        f"{e('rank')} <b>رنک</b> — رتبه‌بندی کاربران و برترین محتوا\n"
+        f"{e('upload')} <b>ثبت محتوا</b> — فایل ویدیویی، عکس یا موزیک را در پیوی بات بفرست؛ پس از بررسی مدیریت به آرشیو اضافه می‌شود\n"
+        f"{e('like')} <b>امتیازدهی</b> — برای هر محتوا یک رأی ثبت می‌شود و امکان تغییر رأی وجود دارد\n"
+        f"{e('stats')} <b>سیستم سطح</b> — با ارسال محتوای تأییدشده و دریافت لایک، امتیاز فعالیت افزایش پیدا می‌کند."
+    )
+
+
+async def help_command(update, context):
+    ensure_user(update.effective_user)
+    await update.effective_message.reply_text(
+        help_text(), parse_mode=ParseMode.HTML,
+        reply_markup=main_menu(update.effective_user.id == OWNER_ID, db.execute("SELECT role FROM users WHERE user_id=?", (update.effective_user.id,)).fetchone()[0] == "Admin"),
+    )
+
+
+async def edit_callback_message(q, text, reply_markup=None):
+    msg = q.message
+    if msg and (msg.photo or msg.video or msg.audio or msg.document):
+        return await q.edit_message_caption(
+            caption=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
+        )
+    return await q.edit_message_text(
+        text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
+    )
+
+
+async def menu_callback(update, context):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    if data == "menu:close":
+        await edit_callback_message(q, f"{e('brand')} <b>پنل بسته شد.</b>", None)
+    elif data == "menu:home":
+        await edit_callback_message(
+            q, f"{e('brand')} {e('brand2')} {e('brand3')} <b>منوی i3l.exe</b>",
+            main_menu(q.from_user.id == OWNER_ID, (db.execute("SELECT role FROM users WHERE user_id=?", (q.from_user.id,)).fetchone() or ("Member",))[0] == "Admin"),
+        )
+    elif data == "menu:profile":
+        ensure_user(q.from_user)
+        row = db.execute("SELECT profile_photo_id FROM users WHERE user_id=?", (q.from_user.id,)).fetchone()
+        photo = row[0] if row else None
+        if photo:
+            await q.message.reply_photo(
+                photo, caption=profile_text(q.from_user.id), parse_mode=ParseMode.HTML,
+                reply_markup=profile_keyboard(q.from_user.id, True),
+            )
+        else:
+            await edit_callback_message(
+                q, profile_text(q.from_user.id), profile_keyboard(q.from_user.id, True)
+            )
+    elif data in ("menu:edit", "menu:music", "menu:photo"):
+        await q.edit_message_text(
+            "برای دریافت محتوا، دستور مربوطه را در گروهی که بات عضو آن است ارسال کن: ادیت، موزیک یا عکس.",
+            reply_markup=InlineKeyboardMarkup([[btn("برگشت", "menu:home", "back")]]),
+        )
+    elif data == "menu:stats":
+        total = db.execute("SELECT COUNT(*) FROM media WHERE approved=1").fetchone()[0]
+        edits = db.execute("SELECT COUNT(*) FROM media WHERE approved=1 AND kind='video'").fetchone()[0]
+        music = db.execute("SELECT COUNT(*) FROM media WHERE approved=1 AND kind IN ('audio','document_audio')").fetchone()[0]
+        photos = db.execute("SELECT COUNT(*) FROM media WHERE approved=1 AND kind='photo'").fetchone()[0]
+        people = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        await q.edit_message_text(
+            f"{e('stats')} <b>آمار i3l.exe</b>\n\nکاربران: {people}\nکل محتوا: {total}\nادیت: {edits}\nموزیک: {music}\nعکس: {photos}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[btn("برگشت", "menu:home", "back")]]),
+        )
+    elif data == "menu:help":
+        await q.edit_message_text(
+            help_text(), parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[btn("برگشت", "menu:home", "back")]]),
+        )
+    elif data == "menu:ranks":
+        await q.edit_message_text(
+            f"{e('rank')} <b>مرکز رتبه‌بندی i3l.exe</b>\nبخش موردنظرت رو انتخاب کن:",
+            parse_mode=ParseMode.HTML, reply_markup=rank_menu(),
+        )
+    elif data.startswith("rank:"):
+        kind = data.split(":", 1)[1]
+        if kind == "content":
+            await q.edit_message_text(
+                f"{e('approve')} <b>برترین محتوای i3l.exe</b>\nنوع محتوا رو انتخاب کن:",
+                parse_mode=ParseMode.HTML, reply_markup=top_content_menu(),
+            )
+        else:
+            result = top_users_text() if kind == "tops" else ranking_text(kind)
+            await q.edit_message_text(
+                result, parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[btn("برگشت", "menu:ranks", "back")]]),
+            )
+    elif data.startswith("top:"):
+        kind = data.split(":", 1)[1]
+        await q.edit_message_text(
+            top_media_text(kind), parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[btn("برگشت", "rank:content", "back")]]),
+        )
+        if kind == "music":
+            items = db.execute(
+                "SELECT id,file_id,kind,sender_id,username FROM media "
+                "WHERE kind IN ('audio','document_audio') AND approved=1"
+            ).fetchall()
+        else:
+            media_kind = "video" if kind == "video" else "photo"
+            items = db.execute(
+                "SELECT id,file_id,kind,sender_id,username FROM media "
+                "WHERE kind=? AND approved=1", (media_kind,)
+            ).fetchall()
+        ranked_items = []
+        for item in items:
+            likes, dislikes = vote_counts(item[0])
+            ranked_items.append((likes - dislikes, likes, item))
+        ranked_items.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        for place, (_, likes, item) in enumerate(ranked_items[:3], 1):
+            mid, file_id, media_kind, sender, username = item
+            label = {"video": "ویدیوی برتر", "photo": "عکس برتر", "music": "موزیک برتر"}[kind]
+            caption = (
+                f"{e('brand')} <b>{label} #{place}</b>\n"
+                f"{e('like')} لایک: <b>{likes}</b>\n"
+                f"منتخب i3l.exe"
+            )
+            await send_media(q.message.chat_id, file_id, media_kind, caption, vote_buttons(mid), context)
+    elif data.startswith("profile:"):
+        _, action, uid = data.split(":")
+        uid = int(uid)
+        if uid != q.from_user.id:
+            await q.answer("این تنظیمات فقط برای صاحب پروفایل است.", show_alert=True)
+            return
+        if action == "colors":
+            kb = InlineKeyboardMarkup([
+                [btn("سبز", "color:green", "approve", "success"),
+                 btn("آبی", "color:blue", "profile"),
+                 btn("قرمز", "color:red", "reject", "danger")],
+                [btn("برگشت", "menu:profile", "back")],
+            ])
+            await q.edit_message_text("رنگ پروفایل را انتخاب کن:", reply_markup=kb)
+        elif action == "creator":
+            db.execute(
+                "UPDATE users SET show_creator=CASE WHEN show_creator=1 THEN 0 ELSE 1 END WHERE user_id=?",
+                (uid,),
+            )
+            db.commit()
+            await edit_callback_message(q, profile_text(uid), profile_keyboard(uid, True))
+        elif action == "bio":
+            context.user_data["await_bio"] = True
+            await edit_callback_message(
+                q, "بیوی جدیدت را به صورت یک پیام متنی بفرست.",
+                InlineKeyboardMarkup([[btn("برگشت", "menu:home", "back")]]),
+            )
+        elif action == "photo":
+            context.user_data["await_profile_photo"] = True
+            await edit_callback_message(
+                q, "عکس موردنظرت را همین‌جا ارسال کن.",
+                InlineKeyboardMarkup([[btn("برگشت", "menu:home", "back")]]),
+            )
+    elif data.startswith("color:"):
+        color = data.split(":", 1)[1]
+        if q.from_user.id == OWNER_ID:
+            db.execute("UPDATE users SET role='Owner',color='Owner' WHERE user_id=?", (OWNER_ID,))
+        else:
+            db.execute("UPDATE users SET color=? WHERE user_id=?", (color, q.from_user.id))
+        db.commit()
+        await edit_callback_message(
+            q, profile_text(q.from_user.id), profile_keyboard(q.from_user.id, True)
+        )
+
+
+async def text_router(update, context):
+    msg, user = update.effective_message, update.effective_user
+    if not user or not msg or not msg.text:
+        return
+    ensure_user(user)
+    if context.user_data.pop("await_bio", False):
+        db.execute("UPDATE users SET bio=? WHERE user_id=?", (msg.text[:160], user.id))
+        db.commit()
+        await msg.reply_text("بیو ذخیره شد.")
+        return
+    if context.user_data.pop("await_media_delete", False):
+        row = db.execute("SELECT role FROM users WHERE user_id=?", (user.id,)).fetchone()
+        if user.id != OWNER_ID and (not row or row[0] != "Admin"):
+            await msg.reply_text("اجازه حذف محتوا نداری.")
+            return
+        raw_mid = msg.text.strip()
+        if not raw_mid.isdigit():
+            await msg.reply_text("شناسه محتوا باید عددی باشد. دوباره شناسه را بفرست.")
+            context.user_data["await_media_delete"] = True
+            return
+        mid = int(raw_mid)
+        exists = db.execute("SELECT id FROM media WHERE id=?", (mid,)).fetchone()
+        if not exists:
+            await msg.reply_text("محتوایی با این شناسه پیدا نشد.")
+            return
+        db.execute("DELETE FROM votes WHERE media_id=?", (mid,))
+        db.execute("DELETE FROM media WHERE id=?", (mid,))
+        db.commit()
+        await msg.reply_text(
+            f"محتوای شماره <code>{mid}</code> از آرشیو حذف شد.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_panel_keyboard(user.id == OWNER_ID),
+        )
+        return
+    pending_role = context.user_data.get("await_role_user")
+    if pending_role:
+        if user.id != OWNER_ID:
+            context.user_data.pop("await_role_user", None)
+            return
+        raw_id = msg.text.strip()
+        if raw_id.startswith("@"): 
+            username = raw_id[1:].strip().lower()
+            found = db.execute(
+                "SELECT user_id FROM users WHERE lower(username)=?", (username,)
+            ).fetchone()
+            if not found:
+                await msg.reply_text(
+                    "این یوزرنیم در کاربران بات پیدا نشد. کاربر باید یک بار وارد پیوی بات شود و /start بزند؛ بعد دوباره یوزرنیمش را بفرست."
+                )
+                return
+            target_id = found[0]
+        elif raw_id.isdigit():
+            target_id = int(raw_id)
+        else:
+            await msg.reply_text("آیدی عددی یا یوزرنیم با @ بفرست.")
+            return
+        role = pending_role["role"]
+        action = pending_role["action"]
+        context.user_data.pop("await_role_user", None)
+        if target_id == OWNER_ID:
+            await msg.reply_text("مقام سازنده قابل تغییر نیست.")
+            return
+        if action == "add":
+            db.execute(
+                "INSERT INTO users(user_id,role) VALUES(?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET role=excluded.role",
+                (target_id, role),
+            )
+            result = f"کاربر <code>{target_id}</code> با مقام <b>{role}</b> ثبت شد."
+        else:
+            db.execute(
+                "UPDATE users SET role='Member' WHERE user_id=? AND role=?",
+                (target_id, role),
+            )
+            result = f"مقام <b>{role}</b> از کاربر <code>{target_id}</code> برداشته شد."
+        db.commit()
+        await msg.reply_text(
+            result, parse_mode=ParseMode.HTML,
+            reply_markup=admin_panel_keyboard(user.id == OWNER_ID),
+        )
+        return
+    if msg.text.strip() in ("پروفایل", "پروفایل من"):
+        await profile_command(update, context)
+
+
+async def count_group_messages(update, context):
+    msg = update.effective_message
+    if not msg or msg.chat.type not in ("group", "supergroup"):
+        return
+    db.execute(
+        "INSERT INTO group_chats(chat_id,title,chat_type,active) VALUES(?,?,?,1) "
+        "ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,chat_type=excluded.chat_type,active=1",
+        (msg.chat_id, msg.chat.title or "گروه", msg.chat.type),
+    )
+    row = db.execute("SELECT message_count FROM group_counts WHERE chat_id=?", (msg.chat_id,)).fetchone()
+    count = (row[0] if row else 0) + 1
+    db.execute(
+        "INSERT INTO group_counts(chat_id,message_count) VALUES(?,?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET message_count=excluded.message_count",
+        (msg.chat_id, count),
+    )
+    db.commit()
+    if count % AUTO_EDIT_EVERY != 0:
+        return
+    # The automatic feature spotlights the bot, not the uploader.
+    intro = (
+        f"{e('brand')} {e('brand2')} {e('brand3')} <b>منتخب i3l.exe</b>\n\n"
+        f"{e('edit')} <b>ادیت</b> — دریافت ادیت تصادفی\n"
+        f"{e('music')} <b>موزیک</b> — دریافت موزیک تصادفی\n"
+        f"{e('photo')} <b>عکس</b> — دریافت عکس تصادفی\n"
+        f"{e('profile')} <b>پروفایل</b> — مشاهده پروفایل\n"
+        f"{e('rank')} <b>رنک</b> — رتبه‌بندی کاربران و برترین محتوا\n\n"
+        "می‌تونید با فرستادن محتوای خودتون در پیوی بات، اون‌ها رو به اشتراک بزارید."
+    )
+    items = media_rows(("video",))
+    markup = InlineKeyboardMarkup([[btn("برترین محتوا", "rank:content", "approve", "success")]])
+    if items:
+        mid, file_id, kind, sender, username = random.choice(items)
+        await send_media(msg.chat_id, file_id, kind, intro, vote_buttons(mid), context)
+        # Attach a separate discover button so the top-content area is accessible from the promo.
+        try:
+            await context.bot.send_message(
+                msg.chat_id, f"{e('brand')} برای دیدن برترین محتوا از این بخش استفاده کن.",
+                parse_mode=ParseMode.HTML, reply_markup=markup,
+            )
+        except Exception:
+            logging.exception("Could not send top-content shortcut")
+    else:
+        await context.bot.send_message(
+            msg.chat_id, intro, parse_mode=ParseMode.HTML, reply_markup=markup
+        )
+
+
+async def announce_command(update, context):
+    if update.effective_user.id != OWNER_ID:
+        await update.effective_message.reply_text("این دستور فقط در اختیار سازنده بات است.")
+        return
+    msg = update.effective_message
+    raw = msg.text or ""
+    command_match = re.match(r"^/announce(?:@\w+)?", raw)
+    if not command_match:
+        await msg.reply_text("متن اعلامیه را بعد از دستور بنویس.")
+        return
+    body_start = command_match.end()
+    if body_start < len(raw) and raw[body_start].isspace():
+        body_start += 1  # remove only the command separator; preserve all other spacing
+    announcement = raw[body_start:]
+    if not announcement.strip():
+        await msg.reply_text("متن اعلامیه را بعد از دستور بنویس. قالب‌بندی و ایموجی پریمیومی حفظ می‌شود.")
+        return
+    chats = db.execute("SELECT chat_id,title FROM group_chats WHERE active=1").fetchall()
+    if not chats:
+        await msg.reply_text("هنوز گروهی در فهرست بات ثبت نشده است.")
+        return
+    prefix = "اعلامیه رسمی i3l.exe\n\n"
+    body_offset = len(raw[:body_start].encode("utf-16-le")) // 2
+    prefix_offset = len(prefix.encode("utf-16-le")) // 2
+    entities = []
+    for entity in (msg.entities or []):
+        if entity.type == "bot_command" or entity.offset + entity.length <= body_offset:
+            continue
+        cloned = copy.deepcopy(entity)
+        original_end = cloned.offset + cloned.length
+        cloned.offset = prefix_offset + max(0, cloned.offset - body_offset)
+        cloned.length = max(0, original_end - max(body_offset, entity.offset))
+        if cloned.length:
+            entities.append(cloned)
+    outgoing = prefix + announcement
+    sent = failed = 0
+    for chat_id, title in chats:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text=outgoing, entities=entities or None,
+                disable_web_page_preview=True,
+            )
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            logging.warning("Broadcast failed for %s (%s): %s", title, chat_id, exc)
+            error_text = str(exc).lower()
+            if "chat not found" in error_text or "bot was kicked" in error_text:
+                db.execute("UPDATE group_chats SET active=0 WHERE chat_id=?", (chat_id,))
+    db.commit()
+    await msg.reply_text(f"اعلامیه ارسال شد.\nموفق: {sent} گروه\nناموفق: {failed} گروه")
+
+
+def admin_panel_keyboard(is_owner):
+    rows = []
+    if is_owner:
+        rows.extend([
+            [btn("افزودن Admin", "role:add:Admin", "admin", "success"),
+             btn("حذف Admin", "role:remove:Admin", "delete", "danger")],
+            [btn("افزودن VIP", "role:add:VIP", "vip", "success"),
+             btn("حذف VIP", "role:remove:VIP", "delete", "danger")],
+        ])
+    rows.append([btn("حذف محتوا از آرشیو", "media:delete", "delete", "danger")])
+    rows.append([btn("برگشت", "menu:home", "back")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def admin_panel_callback(update, context):
+    q = update.callback_query
+    row = db.execute("SELECT role FROM users WHERE user_id=?", (q.from_user.id,)).fetchone()
+    is_owner = q.from_user.id == OWNER_ID
+    if not is_owner and (not row or row[0] != "Admin"):
+        await q.answer("فقط سازنده و ادمین‌ها به این بخش دسترسی دارند.", show_alert=True)
+        return
+    await q.answer()
+    await edit_callback_message(
+        q,
+        f"{e('admin')} <b>پنل مدیریت i3l.exe</b>\n\nعملیات موردنظرت رو انتخاب کن.",
+        admin_panel_keyboard(is_owner),
+    )
+
+
+async def role_action_callback(update, context):
+    q = update.callback_query
+    if q.from_user.id != OWNER_ID:
+        await q.answer("فقط سازنده به این بخش دسترسی دارد.", show_alert=True)
+        return
+    _, action, role = q.data.split(":")
+    context.user_data["await_role_user"] = {"action": action, "role": role}
+    await q.answer()
+    await edit_callback_message(
+        q,
+        f"یوزرنیم با @ یا آیدی عددی کاربر را بفرست تا {'به' if action == 'add' else 'از او'} مقام <b>{role}</b> {'داده شود' if action == 'add' else 'گرفته شود'}.",
+        InlineKeyboardMarkup([[btn("لغو", "admin:panel", "back")]]),
+    )
+
+
+async def media_delete_callback(update, context):
+    q = update.callback_query
+    row = db.execute("SELECT role FROM users WHERE user_id=?", (q.from_user.id,)).fetchone()
+    if q.from_user.id != OWNER_ID and (not row or row[0] != "Admin"):
+        await q.answer("اجازه حذف محتوا نداری.", show_alert=True)
+        return
+    context.user_data["await_media_delete"] = True
+    await q.answer()
+    await edit_callback_message(
+        q,
+        "شناسه عددی محتوایی که می‌خواهی از آرشیو حذف کنی بفرست. شناسه محتوا در بخش برترین محتوا هم نمایش داده می‌شود.",
+        InlineKeyboardMarkup([[btn("لغو", "admin:panel", "back")]]),
+    )
+
+
+async def welcome(update, context):
+    for member in update.message.new_chat_members:
+        if member.id == context.bot.id:
+            db.execute(
+                "INSERT INTO group_chats(chat_id,title,chat_type,active) VALUES(?,?,?,1) "
+                "ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,active=1",
+                (update.effective_chat.id, update.effective_chat.title or "گروه", update.effective_chat.type),
+            )
+            db.commit()
+            await update.message.reply_text(
+                f"{e('brand')} <b>شما بات i3l.exe رو اضافه کردین</b>\n\n"
+                "ادیت، موزیک، عکس و رنک در دسترسه. برای راهنما /help رو بزنید.",
+                parse_mode=ParseMode.HTML, reply_markup=main_menu(),
+            )
+            break
+
+
+def main():
+    token = os.environ.get("BOT_TOKEN")
+    if not token:
+        print("BOT_TOKEN تنظیم نشده!")
+        return
+    app = Application.builder().token(token).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("profile", profile_command))
+    app.add_handler(CommandHandler("announce", announce_command))
+    app.add_handler(CommandHandler("manage", admin_panel_command))
+    private_media = filters.ChatType.PRIVATE & (
+        filters.VIDEO | filters.PHOTO | filters.AUDIO | filters.Document.AUDIO
+    )
+    app.add_handler(MessageHandler(private_media, receive_media))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_router))
+    group = filters.ChatType.GROUPS
+    # Run message counting before command-like text handlers.
+    app.add_handler(MessageHandler(group, count_group_messages), group=-1)
+    app.add_handler(MessageHandler(group & filters.Regex(r"^ادیت$"), random_video))
+    app.add_handler(MessageHandler(group & filters.Regex(r"^موزیک$"), random_music))
+    app.add_handler(MessageHandler(group & filters.Regex(r"^عکس$"), random_photo))
+    app.add_handler(MessageHandler(group & filters.Regex(r"^رنک$"), ranking))
+    app.add_handler(MessageHandler(group & filters.Regex(r"^رنک (موزیک|عکس|کلی)$"), ranking))
+    app.add_handler(MessageHandler(group & filters.TEXT & ~filters.COMMAND, text_router))
+    app.add_handler(CallbackQueryHandler(review_callback, pattern=r"^review:"))
+    app.add_handler(CallbackQueryHandler(vote_callback, pattern=r"^vote:"))
+    app.add_handler(CallbackQueryHandler(admin_panel_callback, pattern=r"^admin:panel$"))
+    app.add_handler(CallbackQueryHandler(role_action_callback, pattern=r"^role:"))
+    app.add_handler(CallbackQueryHandler(media_delete_callback, pattern=r"^media:delete$"))
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|rank:|top:|profile:|color:)"))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
+    print(f"{BOT_NAME} is online.")
+    app.run_polling()
+
+
+async def admin_panel_command(update, context):
+    user = update.effective_user
+    row = db.execute("SELECT role FROM users WHERE user_id=?", (user.id,)).fetchone()
+    is_owner = user.id == OWNER_ID
+    if not is_owner and (not row or row[0] != "Admin"):
+        await update.effective_message.reply_text("این دستور فقط برای سازنده و ادمین‌های بات است.")
+        return
+    await update.effective_message.reply_text(
+        f"{e('admin')} <b>پنل مدیریت i3l.exe</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_panel_keyboard(is_owner),
+    )
+
+
+if __name__ == "__main__":
+    main()

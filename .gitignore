@@ -1,0 +1,33 @@
+# Environment / secrets — never commit these
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Vercel
+.vercel/
+
+# Local development databases (the historical backups *i3l_backup.db* and
+# *i3l_v1.db* are intentionally tracked and must be preserved)
+i3l.db
+i3l.db-journal
+*.db-shm
+*.db-wal
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

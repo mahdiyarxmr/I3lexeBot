@@ -1,0 +1,8 @@
+# i3l.exe Telegram bot — Vercel serverless runtime
+# Vercel automatically runs `pip install -r requirements.txt` for Python projects.
+
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-telegram-bot>=21.7,<23
+psycopg[binary,pool]>=3.1.0
+python-dotenv>=1.0.0

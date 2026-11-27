@@ -29,6 +29,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("profile", H.profile_command))
     app.add_handler(CommandHandler("announce", H.announce_command))
     app.add_handler(CommandHandler("manage", H.admin_panel_command))
+    app.add_handler(CommandHandler("cancel", H.cancel_waiting_command))
     app.add_handler(CommandHandler("setreviewgroup", H.set_review_group))
     app.add_handler(CommandHandler("restoremedia", H.restore_media_command))
 
@@ -39,6 +40,12 @@ def build_application() -> Application:
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, H.text_router))
 
     group = filters.ChatType.GROUPS
+    group_media = group & (
+        filters.VIDEO | filters.PHOTO | filters.AUDIO | filters.Document.AUDIO
+    )
+    # Media sent in a group chat is submitted for admin review (approve/reject
+    # via inline buttons posted back into the same group).
+    app.add_handler(MessageHandler(group_media, H.receive_media))
     # Run message counting before command-like text handlers.
     app.add_handler(MessageHandler(group, H.count_group_messages), group=-1)
     app.add_handler(MessageHandler(group & filters.Regex(r"^ادیت$"), H.random_video))
@@ -53,6 +60,7 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(H.admin_panel_callback, pattern=r"^admin:panel$"))
     app.add_handler(CallbackQueryHandler(H.role_action_callback, pattern=r"^role:"))
     app.add_handler(CallbackQueryHandler(H.media_delete_callback, pattern=r"^media:delete$"))
+    app.add_handler(CallbackQueryHandler(H.cancel_waiting_callback, pattern=r"^cancel:waiting$"))
     app.add_handler(CallbackQueryHandler(H.menu_callback, pattern=r"^(menu:|rank:|top:|profile:|color:)"))
 
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, H.welcome))

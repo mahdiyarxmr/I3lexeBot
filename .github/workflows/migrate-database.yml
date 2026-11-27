@@ -44,7 +44,41 @@ jobs:
 
       - name: Mask secrets
         run: |
-          echo "::add-mask::${DATABASE_URL}"
+          if [ -n "${DATABASE_URL}" ]; then
+            echo "::add-mask::${DATABASE_URL}"
+          else
+            echo "::error::DATABASE_URL GitHub secret is not set for this repository"
+            exit 1
+          fi
+
+      - name: PostgreSQL counts BEFORE migration
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg
+
+          TABLES = (
+              "users", "media", "votes", "owner_votes", "profile_votes",
+              "roles", "profile_photos", "group_chats", "group_counts",
+              "review_messages", "bot_settings", "moderation_audit",
+          )
+          with psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=15) as conn:
+              with conn.cursor() as cur:
+                  cur.execute(
+                      "SELECT table_name FROM information_schema.tables "
+                      "WHERE table_schema = 'public'"
+                  )
+                  existing = {r[0] for r in cur.fetchall()}
+                  print("=== PostgreSQL row counts BEFORE migration ===")
+                  for t in TABLES:
+                      if t in existing:
+                          cur.execute(f'SELECT COUNT(*) FROM "{t}"')
+                          print(f"{t}: {cur.fetchone()[0]}")
+                      else:
+                          print(f"{t}: MISSING_TABLE")
+          PY
 
       - name: Run migration
         env:
@@ -56,7 +90,7 @@ jobs:
           fi
           python scripts/migrate_sqlite_to_postgres.py "${args[@]}"
 
-      - name: Verify row counts
+      - name: PostgreSQL counts AFTER migration + FK integrity
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
@@ -64,15 +98,62 @@ jobs:
           import os
           import psycopg
 
-          dsn = os.environ["DATABASE_URL"]
-          with psycopg.connect(dsn, connect_timeout=10) as conn:
+          TABLES = (
+              "users", "media", "votes", "owner_votes", "profile_votes",
+              "roles", "profile_photos", "group_chats", "group_counts",
+              "review_messages", "bot_settings", "moderation_audit",
+          )
+          EXPECTED_FKS = (
+              "fk_votes_media", "fk_owner_votes_media",
+              "fk_moderation_audit_media", "fk_review_messages_media",
+              "fk_group_counts_chat", "fk_roles_user",
+              "fk_profile_photos_user", "fk_profile_votes_user",
+          )
+          # (child_table, child_col, parent_table, parent_col)
+          FK_CHECKS = (
+              ("votes", "media_id", "media", "id"),
+              ("owner_votes", "media_id", "media", "id"),
+              ("moderation_audit", "media_id", "media", "id"),
+              ("review_messages", "media_id", "media", "id"),
+              ("group_counts", "chat_id", "group_chats", "chat_id"),
+              ("roles", "user_id", "users", "user_id"),
+              ("profile_photos", "user_id", "users", "user_id"),
+              ("profile_votes", "profile_id", "users", "user_id"),
+          )
+          with psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=15) as conn:
               with conn.cursor() as cur:
-                  for table in (
-                      "users", "media", "votes", "owner_votes",
-                      "profile_votes", "roles", "profile_photos",
-                      "group_chats", "group_counts", "review_messages",
-                      "bot_settings", "moderation_audit",
-                  ):
-                      cur.execute('SELECT COUNT(*) FROM "%s"' % table)
-                      print(f"{table}: {cur.fetchone()[0]}")
+                  cur.execute(
+                      "SELECT table_name FROM information_schema.tables "
+                      "WHERE table_schema = 'public'"
+                  )
+                  existing = {r[0] for r in cur.fetchall()}
+                  print("=== PostgreSQL row counts AFTER migration ===")
+                  for t in TABLES:
+                      if t in existing:
+                          cur.execute(f'SELECT COUNT(*) FROM "{t}"')
+                          print(f"{t}: {cur.fetchone()[0]}")
+                      else:
+                          print(f"{t}: MISSING_TABLE")
+
+                  print("=== Foreign key constraints ===")
+                  cur.execute(
+                      "SELECT conname FROM pg_constraint "
+                      "WHERE contype = 'f' AND connamespace = 'public'::regnamespace"
+                  )
+                  present = {r[0] for r in cur.fetchall()}
+                  for name in EXPECTED_FKS:
+                      print(f"{name}: {'present' if name in present else 'MISSING'}")
+
+                  print("=== Dangling foreign-key references (must all be 0) ===")
+                  for child, ccol, parent, pcol in FK_CHECKS:
+                      if child in existing and parent in existing:
+                          cur.execute(
+                              f'SELECT COUNT(*) FROM "{child}" c '
+                              f'LEFT JOIN "{parent}" p ON c."{ccol}" = p."{pcol}" '
+                              f'WHERE p."{pcol}" IS NULL'
+                          )
+                          n = cur.fetchone()[0]
+                          print(f"{child}.{ccol} -> {parent}.{pcol}: {n}")
+                      else:
+                          print(f"{child}.{ccol} -> {parent}.{pcol}: skipped (table missing)")
           PY

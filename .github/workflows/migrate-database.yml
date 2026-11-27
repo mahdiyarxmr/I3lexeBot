@@ -42,14 +42,25 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Mask secrets
+      - name: DATABASE_URL secret diagnostic
+        # Safe diagnostic: reports ONLY whether the secret is set and its
+        # character length. The value itself is never printed or logged.
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           if [ -n "${DATABASE_URL}" ]; then
-            echo "::add-mask::${DATABASE_URL}"
+            echo "DATABASE_URL secret: SET (length=${#DATABASE_URL})"
           else
+            echo "DATABASE_URL secret: NOT SET (empty or missing)"
             echo "::error::DATABASE_URL GitHub secret is not set for this repository"
             exit 1
           fi
+
+      - name: Mask secrets
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          echo "::add-mask::${DATABASE_URL}"
 
       - name: PostgreSQL counts BEFORE migration
         env:

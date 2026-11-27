@@ -7,7 +7,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 RUNTIME_FILES = [
     "app.py",
-    "main.py",
+    "botteli3l_new.py",
     "api/webhook.py",
     "bot/handlers.py",
     "bot/telegram_app.py",

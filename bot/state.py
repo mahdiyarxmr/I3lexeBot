@@ -30,6 +30,7 @@ PENDING_KEYS = (
     "await_role_user",
     "await_bio",
     "await_profile_photo",
+    "await_review_group",
 )
 
 # Waiting states expire after this many seconds (10 minutes by default).

@@ -20,6 +20,7 @@ from telegram import InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
+from .db import DatabaseError
 from .runtime import AUTO_EDIT_EVERY, OWNER_ID, db, rate_limiter, state
 from .ui import btn, e, safe
 
@@ -636,13 +637,30 @@ async def profile_command(update, context):
 
 
 async def start(update, context):
-    await ensure_user(update.effective_user)
+    # The database backs user registration and the role lookup, but a database
+    # outage must not stop /start entirely: reply gracefully (Telegram still
+    # receives a processed update) instead of failing the request.
+    db_ok = True
+    try:
+        await ensure_user(update.effective_user)
+    except DatabaseError as exc:
+        logger.error("Database unavailable during /start user lookup: %s", exc)
+        db_ok = False
     txt = (
         f"{e('brand')} {e('brand2')} {e('brand3')} <b>به i3l.exe خوش اومدی</b>\n\n"
         "اینجا آرشیو ادیت، موزیک و عکس همراه با پروفایل و سیستم رتبه‌بندی در دسترسه. "
         "از منوی لمسی زیر بخش موردنظرت رو انتخاب کن. برای ثبت محتوا، فایل رو در گفت‌وگوی خصوصی بات بفرست تا بررسی بشه."
     )
-    row = await db.fetchone("SELECT role FROM users WHERE user_id=%s", (update.effective_user.id,))
+    if not db_ok:
+        txt += "\n\n⚠️ سرویس در حال بازگشت است؛ کمی بعد دوباره /start بزن."
+        row = None
+    else:
+        try:
+            row = await db.fetchone("SELECT role FROM users WHERE user_id=%s", (update.effective_user.id,))
+        except DatabaseError as exc:
+            logger.error("Database unavailable during /start role lookup: %s", exc)
+            db_ok = False
+            row = None
     await update.effective_message.reply_text(
         txt, parse_mode=ParseMode.HTML,
         reply_markup=main_menu(

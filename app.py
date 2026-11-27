@@ -114,66 +114,6 @@ async def health():
     return {"status": "ok"}
 
 
-# TEMPORARY verification route (removed after migration verification):
-# returns row counts from the configured PostgreSQL. Never returns the
-# DATABASE_URL value or any other secret.
-@app.get("/api/db-counts")
-async def db_counts():
-    import os
-
-    import psycopg
-
-    dsn = os.environ.get("DATABASE_URL", "")
-    if not dsn:
-        return {"ok": False, "error": "DATABASE_URL not set"}
-    tables = [
-        "users", "media", "votes", "owner_votes", "profile_votes", "roles",
-        "profile_photos", "group_chats", "group_counts", "review_messages",
-        "bot_settings", "moderation_audit", "conversation_state", "rate_limits",
-    ]
-    try:
-        with psycopg.connect(dsn, connect_timeout=10) as conn:
-            counts = {}
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT table_name FROM information_schema.tables "
-                    "WHERE table_schema = 'public'"
-                )
-                existing = {r[0] for r in cur.fetchall()}
-                for table in tables:
-                    if table in existing:
-                        cur.execute(f'SELECT COUNT(*) FROM "{table}"')
-                        counts[table] = cur.fetchone()[0]
-                    else:
-                        counts[table] = "MISSING_TABLE"
-            return {"ok": True, "counts": counts}
-    except Exception as exc:  # never leak the DSN or credentials
-        logger.error("db_counts check failed: %s", type(exc).__name__)
-        return {"ok": False, "error": type(exc).__name__}
-
-
-@app.get("/health-verbose")
-async def health_verbose():
-    # TEMPORARY: health plus row counts, for rollout diagnostics.
-    import os
-
-    import psycopg
-
-    out = {"status": "ok"}
-    dsn = os.environ.get("DATABASE_URL", "")
-    if dsn:
-        try:
-            with psycopg.connect(dsn, connect_timeout=10) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT COUNT(*) FROM users")
-                    out["users"] = cur.fetchone()[0]
-                    cur.execute("SELECT COUNT(*) FROM media")
-                    out["media"] = cur.fetchone()[0]
-        except Exception as exc:
-            out["db_error"] = type(exc).__name__
-    return out
-
-
 async def root():
     return {"status": "ok", "service": "i3l.exe", "endpoint": "/api/webhook"}
 

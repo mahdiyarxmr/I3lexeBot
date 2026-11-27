@@ -152,6 +152,28 @@ async def db_counts():
         return {"ok": False, "error": type(exc).__name__}
 
 
+@app.get("/health-verbose")
+async def health_verbose():
+    # TEMPORARY: health plus row counts, for rollout diagnostics.
+    import os
+
+    import psycopg
+
+    out = {"status": "ok"}
+    dsn = os.environ.get("DATABASE_URL", "")
+    if dsn:
+        try:
+            with psycopg.connect(dsn, connect_timeout=10) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM users")
+                    out["users"] = cur.fetchone()[0]
+                    cur.execute("SELECT COUNT(*) FROM media")
+                    out["media"] = cur.fetchone()[0]
+        except Exception as exc:
+            out["db_error"] = type(exc).__name__
+    return out
+
+
 async def root():
     return {"status": "ok", "service": "i3l.exe", "endpoint": "/api/webhook"}
 

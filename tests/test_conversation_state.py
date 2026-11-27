@@ -263,9 +263,10 @@ def test_8_delete_media_still_works_for_admin(database, monkeypatch):
     assert votes[0] == 0
 
 
-def test_9_group_media_posts_review_back_into_group(database, monkeypatch):
-    """Media sent in a group is submitted for review with inline buttons posted
-    into the same group (only admins can approve/reject)."""
+def test_9_upload_confirms_to_sender_and_sends_review_to_admin_group(database, monkeypatch):
+    """Upload flow: the sender gets a star confirmation, the content stays
+    pending, and the review request (media + caption + inline buttons) is
+    sent to the configured review group — never to an admin's DM."""
     sent = {}
 
     async def _send_media(chat_id, file_id, kind, caption, markup, context):
@@ -275,6 +276,15 @@ def test_9_group_media_posts_review_back_into_group(database, monkeypatch):
         return SimpleNamespace(message_id=999)
 
     monkeypatch.setattr("bot.handlers.send_media", _send_media)
+
+    # Configure the review (admins) group.
+    async def _set_group():
+        await database.execute(
+            "INSERT INTO bot_settings(setting_key, setting_value) VALUES('review_group_id', '-1005871054118') "
+            "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value"
+        )
+
+    asyncio.run(_set_group())
 
     replies = []
 
@@ -299,16 +309,96 @@ def test_9_group_media_posts_review_back_into_group(database, monkeypatch):
         await receive_media(update, None)
 
     asyncio.run(_run())
-    assert sent.get("chat_id") == 777
-    assert sent.get("markup") is not None
 
+    # 1. Sender receives the star confirmation — and nothing about archiving.
+    assert any("⭐ محتوای شما برای تأیید ارسال شد" in r for r in replies)
+    assert not any("آرشیو" in r for r in replies)
+
+    # 2. Review goes to the configured admins group, with buttons.
+    assert sent.get("chat_id") == -1005871054118
+    assert sent.get("markup") is not None
+    caption = sent.get("caption", "")
+    assert "⭐ <b>محتوای جدید</b>" in caption
+    assert "فرستنده: @u" in caption
+    assert "<code>" in caption
+    assert "نوع: عکس" in caption
+
+    # 3. The media is stored pending, not approved/archived.
     async def _check():
         row = await database.fetchone(
-            "SELECT chat_id, message_id FROM review_messages WHERE chat_id=777",
+            "SELECT approved, review_status, chat_id, message_id "
+            "FROM media m JOIN review_messages r ON r.media_id = m.id WHERE r.chat_id = -1005871054118"
         )
         return row
 
-    assert asyncio.run(_check()) == (777, 999)
+    row = asyncio.run(_check())
+    assert row is not None
+    assert row[0] == 0
+    assert row[1] == "pending"
+    assert row[2] == -1005871054118
+    assert row[3] == 999
+
+
+def test_10_no_review_group_keeps_pending_and_confirms_sender(database, monkeypatch):
+    """Without a configured review group the sender still gets the star
+    confirmation; the content stays pending and no review content is sent to
+    any admin DM (only a setup warning to the owner)."""
+    sent = []
+    owner_dms = []
+
+    async def _send_media(chat_id, file_id, kind, caption, markup, context):
+        sent.append(chat_id)
+        return SimpleNamespace(message_id=999)
+
+    monkeypatch.setattr("bot.handlers.send_media", _send_media)
+
+    # Ensure no review group is configured (other tests may have set one).
+    async def _clear_group():
+        await database.execute(
+            "DELETE FROM bot_settings WHERE setting_key='review_group_id'"
+        )
+
+    asyncio.run(_clear_group())
+
+    async def _owner_dm(user_id, text, **kwargs):
+        owner_dms.append((user_id, text))
+
+    context = SimpleNamespace(bot=SimpleNamespace(send_message=_owner_dm))
+
+    replies = []
+
+    async def _reply_text(text, **kwargs):
+        replies.append(text)
+
+    msg = SimpleNamespace(
+        video=None, audio=None, document=None,
+        photo=[SimpleNamespace(file_id="pid-fallback")],
+        reply_text=_reply_text,
+        chat_id=USER,
+        chat=SimpleNamespace(id=USER, chat_id=USER, type="private", title=""),
+        text=None,
+    )
+    update = SimpleNamespace(
+        message=msg,
+        effective_message=msg,
+        effective_user=SimpleNamespace(id=USER, username="u", first_name="U"),
+    )
+
+    asyncio.run(receive_media(update, context))
+
+    assert any("⭐ محتوای شما برای تأیید ارسال شد" in r for r in replies)
+    assert sent == []  # nothing was posted anywhere
+    # Only a config warning goes to the owner — never the review content.
+    assert owner_dms and owner_dms[0][0] == OWNER
+    assert "در انتظار بررسی" in owner_dms[0][1]
+
+    async def _check():
+        row = await database.fetchone(
+            "SELECT approved, review_status FROM media WHERE file_id='pid-fallback'"
+        )
+        return row
+
+    assert asyncio.run(_check()) == (0, "pending")
 
 
 def test_default_ttl_is_ten_minutes():

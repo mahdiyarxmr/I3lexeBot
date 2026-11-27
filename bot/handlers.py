@@ -303,16 +303,16 @@ async def receive_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"{e('approve')} ذخیره شد و وارد آرشیو شد.", parse_mode=ParseMode.HTML)
         return
 
-    # In a group chat the review request is posted back into the same group,
-    # so the admins present there can approve/reject it with inline buttons.
-    if msg.chat.type == "private":
-        review_chat_id = await get_review_group_id()
-    else:
-        review_chat_id = msg.chat_id
-    if not review_chat_id:
-        await msg.reply_text(
-            "محتوایت ثبت شد، اما گروه تأیید هنوز توسط Owner تنظیم نشده است. فعلاً در انتظار بررسی می‌ماند."
-        )
+    # The sender only gets a confirmation; the content itself is held back
+    # until an admin approves it in the review group.
+    await msg.reply_text("⭐ محتوای شما برای تأیید ارسال شد.")
+
+    # The review request always goes to the configured review group — never
+    # to an admin's private chat.
+    review_group_id = await get_review_group_id()
+    if not review_group_id:
+        # No review group configured: the content stays pending. Only a brief
+        # setup warning goes to the owner, never the review content itself.
         try:
             await context.bot.send_message(
                 OWNER_ID,
@@ -323,26 +323,24 @@ async def receive_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     label = {"video": "ادیت", "photo": "عکس", "audio": "موزیک", "document_audio": "موزیک"}[kind]
+    sender = "@" + user.username if user.username else (user.first_name or "کاربر")
     caption = (
-        f"{e('upload')} <b>درخواست بررسی محتوا #{media_id}</b>\\n"
-        f"فرستنده: {safe('@' + user.username if user.username else user.first_name)}\\n"
-        f"شناسه کاربر: <code>{user.id}</code>\\nنوع: {label}"
+        "⭐ <b>محتوای جدید</b>\\n"
+        f"فرستنده: {safe(sender)}\\n"
+        f"شناسه: <code>{media_id}</code>\\n"
+        f"نوع: {label}"
     )
     try:
         sent_message = await send_media(
-            review_chat_id, file_id, kind, caption, review_buttons(media_id), context
+            review_group_id, file_id, kind, caption, review_buttons(media_id), context
         )
         await db.execute(
             "INSERT INTO review_messages(media_id,chat_id,message_id,caption) VALUES(%s,%s,%s,%s) "
             "ON CONFLICT (media_id, chat_id, message_id) DO UPDATE SET caption=excluded.caption",
-            (media_id, review_chat_id, sent_message.message_id, caption),
+            (media_id, review_group_id, sent_message.message_id, caption),
         )
-        await msg.reply_text(f"{e('upload')} محتوا برای بررسی در گپ ارسال شد.", parse_mode=ParseMode.HTML)
     except Exception as exc:
-        logger.exception("Could not send media %s to review chat", media_id)
-        await msg.reply_text(
-            "محتوا ثبت شد، اما ارسال آن به گپ بررسی ناموفق بود. به Owner اطلاع داده شد."
-        )
+        logger.exception("Could not send media %s to review group", media_id)
         try:
             await context.bot.send_message(
                 OWNER_ID,
@@ -683,11 +681,11 @@ def help_text():
         f"{e('photo')} <b>عکس</b> — دریافت عکس تصادفی\n"
         f"{e('profile')} <b>پروفایل</b> — مشاهده پروفایل؛ برای دیدن پروفایل دیگران روی پیامشان ریپلای کن\n"
         f"{e('rank')} <b>رنک</b> — رتبه‌بندی کاربران و برترین محتوا\n"
-        f"{e('upload')} <b>ثبت محتوا</b> — فایل ویدیویی، عکس یا موزیک را در پیوی بات (یا داخل گپ) بفرست؛ پس از بررسی مدیریت به آرشیو اضافه می‌شود\n"
+        f"{e('upload')} <b>ثبت محتوا</b> — فایل ویدیویی، عکس یا موزیک را در پیوی بات یا داخل گپ بفرست؛ پیام تأیید دریافت می‌کنید و محتوای شما پس از بررسی و تأیید ادمین‌ها در گروه مدیریت به آرشیو اضافه می‌شود\n"
         f"{e('like')} <b>امتیازدهی</b> — برای هر محتوا یک رأی ثبت می‌شود و امکان تغییر رأی وجود دارد\n"
         f"{e('stats')} <b>سیستم سطح</b> — با ارسال محتوای تأییدشده و دریافت لایک، امتیاز فعالیت افزایش پیدا می‌کند.\n"
         f"<b>دستورات</b> — /start /help /profile /cancel (لغو عملیات در انتظار) و برای Owner و ادمین‌ها /manage (پنل مدیریت)\n"
-        f"<b>بررسی در گپ</b> — محتوایی که در گپ ارسال می‌شود، با دکمه‌های داخلی در همان گپ برای تأیید یا رد توسط ادمین‌ها گذاشته می‌شود."
+        f"<b>بررسی محتوا</b> — محتوای ارسالی با متن و دکمه‌های تأیید/رد داخلی به گروه مدیریت (Admins) ارسال می‌شود؛ تنها ادمین‌ها می‌توانند آن را تأیید یا رد کنند."
     )
 
 

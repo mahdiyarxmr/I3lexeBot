@@ -1,0 +1,78 @@
+# Safe, re-runnable SQLite -> PostgreSQL migration for the i3l.exe bot.
+#
+# Manual-only trigger: nothing runs automatically. The migration script is
+# idempotent — re-running it never duplicates rows, never overwrites existing
+# PostgreSQL rows, and never modifies or deletes the source SQLite files.
+#
+# Required GitHub repository secret:
+#   DATABASE_URL  — the PostgreSQL DSN of the target database (the same value
+#                   configured in Vercel). Never printed by the workflow.
+#
+# Usage:
+#   Actions -> "Migrate database" -> "Run workflow" -> choose the SQLite
+#   source(s) (default: i3l_backup.db) and click "Run workflow".
+
+name: Migrate database
+
+on:
+  workflow_dispatch:
+    inputs:
+      sqlite_file:
+        description: 'SQLite database file to import (in repository root)'
+        required: false
+        default: 'i3l_backup.db'
+      dry_run:
+        description: 'Report what would be imported without writing'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Mask secrets
+        run: |
+          echo "::add-mask::${DATABASE_URL}"
+
+      - name: Run migration
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          args=(--sqlite "${{ inputs.sqlite_file }}")
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          python scripts/migrate_sqlite_to_postgres.py "${args[@]}"
+
+      - name: Verify row counts
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg
+
+          dsn = os.environ["DATABASE_URL"]
+          with psycopg.connect(dsn, connect_timeout=10) as conn:
+              with conn.cursor() as cur:
+                  for table in (
+                      "users", "media", "votes", "owner_votes",
+                      "profile_votes", "roles", "profile_photos",
+                      "group_chats", "group_counts", "review_messages",
+                      "bot_settings", "moderation_audit",
+                  ):
+                      cur.execute('SELECT COUNT(*) FROM "%s"' % table)
+                      print(f"{table}: {cur.fetchone()[0]}")
+          PY

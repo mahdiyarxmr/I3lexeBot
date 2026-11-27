@@ -27,6 +27,11 @@ from .schema import ALL_SQL
 
 logger = logging.getLogger(__name__)
 
+# Fixed key for the transaction-scoped advisory lock that serialises schema
+# initialisation across pooled connections *and* across concurrent webhook
+# invocations (Vercel may run several cold containers at once).
+SCHEMA_LOCK_KEY = 6_969_503_471_285_394_211
+
 
 class DatabaseError(RuntimeError):
     """Raised when the database cannot be reached or a query fails."""
@@ -73,7 +78,18 @@ class Database:
         return self._pool
 
     async def ensure_ready(self) -> None:
-        """Open the pool (once) and make sure the schema exists."""
+        """Open the pool (once) and make sure the schema exists.
+
+        Idempotent and safe against concurrent invocations:
+
+        * all DDL runs inside a single transaction, so a failure rolls back
+          completely and a later call can still succeed;
+        * a transaction-scoped advisory lock (``pg_advisory_xact_lock``)
+          serializes concurrent initialisations across pooled connections and
+          across separate serverless containers, so two simultaneous webhook
+          requests can never race between ``CREATE TABLE`` and
+          ``ALTER TABLE ... ADD CONSTRAINT``.
+        """
         pool = await self._pool_ready()
         if self._schema_ready:
             return
@@ -82,8 +98,15 @@ class Database:
                 return
             try:
                 async with pool.connection() as conn:
-                    async with conn.cursor() as cur:
-                        await cur.execute(ALL_SQL)
+                    # Explicit transaction block (the pool runs in
+                    # autocommit mode, so this starts a real transaction).
+                    async with conn.transaction():
+                        await conn.execute(
+                            "SELECT pg_advisory_xact_lock(%s)",
+                            (SCHEMA_LOCK_KEY,),
+                        )
+                        async with conn.cursor() as cur:
+                            await cur.execute(ALL_SQL)
                 self._schema_ready = True
                 logger.info("PostgreSQL schema is ready.")
             except Exception as exc:
@@ -108,7 +131,7 @@ class Database:
             async with pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(query, params)
-                    return cur.fetchone()
+                    return await cur.fetchone()
         except psycopg.Error as exc:
             raise DatabaseError(str(exc)) from exc
 
@@ -120,7 +143,7 @@ class Database:
             async with pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(query, params)
-                    return cur.fetchall()
+                    return await cur.fetchall()
         except psycopg.Error as exc:
             raise DatabaseError(str(exc)) from exc
 
@@ -133,7 +156,7 @@ class Database:
             async with pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(query, params)
-                    return cur.fetchone()
+                    return await cur.fetchone()
         except psycopg.Error as exc:
             raise DatabaseError(str(exc)) from exc
 

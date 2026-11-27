@@ -1,0 +1,7 @@
+# Development / test dependencies only.
+# Vercel installs requirements.txt for production; this file is for running the
+# test suite locally (it includes a bundled PostgreSQL via pgserver so the
+# schema-init integration tests can run without an external database).
+-r requirements.txt
+pytest>=8.0
+pgserver>=0.1

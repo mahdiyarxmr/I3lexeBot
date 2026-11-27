@@ -71,6 +71,18 @@ CREATE TABLE IF NOT EXISTS users (
     character        TEXT DEFAULT 'None'
 );
 
+-- Legacy table (older versions). Preserved for historical data.
+CREATE TABLE IF NOT EXISTS roles (
+    user_id BIGINT NOT NULL,
+    role    TEXT
+);
+
+-- Legacy table (older versions). Preserved for historical data.
+CREATE TABLE IF NOT EXISTS profile_photos (
+    user_id BIGINT NOT NULL,
+    file_id TEXT
+);
+
 CREATE TABLE IF NOT EXISTS group_counts (
     chat_id       BIGINT PRIMARY KEY,
     message_count INTEGER DEFAULT 0

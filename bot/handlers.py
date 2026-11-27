@@ -277,7 +277,7 @@ async def restore_media_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def receive_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg, user = update.message, update.effective_user
-    if msg.photo and await state.pop(user.id, "await_profile_photo", False):
+    if msg.photo and await state.pop_fresh(user.id, "await_profile_photo", False):
         photo_id = msg.photo[-1].file_id
         await db.execute("UPDATE users SET profile_photo_id=%s WHERE user_id=%s", (photo_id, user.id))
         await msg.reply_text("عکس پروفایل ذخیره شد.")
@@ -303,8 +303,13 @@ async def receive_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"{e('approve')} ذخیره شد و وارد آرشیو شد.", parse_mode=ParseMode.HTML)
         return
 
-    review_group_id = await get_review_group_id()
-    if not review_group_id:
+    # In a group chat the review request is posted back into the same group,
+    # so the admins present there can approve/reject it with inline buttons.
+    if msg.chat.type == "private":
+        review_chat_id = await get_review_group_id()
+    else:
+        review_chat_id = msg.chat_id
+    if not review_chat_id:
         await msg.reply_text(
             "محتوایت ثبت شد، اما گروه تأیید هنوز توسط Owner تنظیم نشده است. فعلاً در انتظار بررسی می‌ماند."
         )
@@ -325,18 +330,18 @@ async def receive_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     try:
         sent_message = await send_media(
-            review_group_id, file_id, kind, caption, review_buttons(media_id), context
+            review_chat_id, file_id, kind, caption, review_buttons(media_id), context
         )
         await db.execute(
             "INSERT INTO review_messages(media_id,chat_id,message_id,caption) VALUES(%s,%s,%s,%s) "
             "ON CONFLICT (media_id, chat_id, message_id) DO UPDATE SET caption=excluded.caption",
-            (media_id, review_group_id, sent_message.message_id, caption),
+            (media_id, review_chat_id, sent_message.message_id, caption),
         )
-        await msg.reply_text(f"{e('upload')} محتوا برای بررسی در گروه مدیریت ارسال شد.", parse_mode=ParseMode.HTML)
+        await msg.reply_text(f"{e('upload')} محتوا برای بررسی در گپ ارسال شد.", parse_mode=ParseMode.HTML)
     except Exception as exc:
-        logger.exception("Could not send media %s to review group", media_id)
+        logger.exception("Could not send media %s to review chat", media_id)
         await msg.reply_text(
-            "محتوا ثبت شد، اما ارسال آن به گروه مدیریت ناموفق بود. به Owner اطلاع داده شد."
+            "محتوا ثبت شد، اما ارسال آن به گپ بررسی ناموفق بود. به Owner اطلاع داده شد."
         )
         try:
             await context.bot.send_message(
@@ -678,9 +683,11 @@ def help_text():
         f"{e('photo')} <b>عکس</b> — دریافت عکس تصادفی\n"
         f"{e('profile')} <b>پروفایل</b> — مشاهده پروفایل؛ برای دیدن پروفایل دیگران روی پیامشان ریپلای کن\n"
         f"{e('rank')} <b>رنک</b> — رتبه‌بندی کاربران و برترین محتوا\n"
-        f"{e('upload')} <b>ثبت محتوا</b> — فایل ویدیویی، عکس یا موزیک را در پیوی بات بفرست؛ پس از بررسی مدیریت به آرشیو اضافه می‌شود\n"
+        f"{e('upload')} <b>ثبت محتوا</b> — فایل ویدیویی، عکس یا موزیک را در پیوی بات (یا داخل گپ) بفرست؛ پس از بررسی مدیریت به آرشیو اضافه می‌شود\n"
         f"{e('like')} <b>امتیازدهی</b> — برای هر محتوا یک رأی ثبت می‌شود و امکان تغییر رأی وجود دارد\n"
-        f"{e('stats')} <b>سیستم سطح</b> — با ارسال محتوای تأییدشده و دریافت لایک، امتیاز فعالیت افزایش پیدا می‌کند."
+        f"{e('stats')} <b>سیستم سطح</b> — با ارسال محتوای تأییدشده و دریافت لایک، امتیاز فعالیت افزایش پیدا می‌کند.\n"
+        f"<b>دستورات</b> — /start /help /profile /cancel (لغو عملیات در انتظار) و برای Owner و ادمین‌ها /manage (پنل مدیریت)\n"
+        f"<b>بررسی در گپ</b> — محتوایی که در گپ ارسال می‌شود، با دکمه‌های داخلی در همان گپ برای تأیید یا رد توسط ادمین‌ها گذاشته می‌شود."
     )
 
 
@@ -823,13 +830,13 @@ async def menu_callback(update, context):
             )
             await edit_callback_message(q, await profile_text(uid), profile_keyboard(uid, True))
         elif action == "bio":
-            await state.set(q.from_user.id, "await_bio", True)
+            await state.set_pending(q.from_user.id, "await_bio", True)
             await edit_callback_message(
                 q, "بیوی جدیدت را به صورت یک پیام متنی بفرست.",
                 InlineKeyboardMarkup([[btn("برگشت", "menu:home", "back")]]),
             )
         elif action == "photo":
-            await state.set(q.from_user.id, "await_profile_photo", True)
+            await state.set_pending(q.from_user.id, "await_profile_photo", True)
             await edit_callback_message(
                 q, "عکس موردنظرت را همین‌جا ارسال کن.",
                 InlineKeyboardMarkup([[btn("برگشت", "menu:home", "back")]]),
@@ -850,19 +857,30 @@ async def text_router(update, context):
     if not user or not msg or not msg.text:
         return
     await ensure_user(user)
-    if await state.pop(user.id, "await_bio", False):
+
+    # A stale state must never swallow ordinary messages: commands and any
+    # input that clearly does not belong to the pending flow exit the wait.
+    if await state.get_fresh(user.id, "await_media_delete", False) or \
+            await state.get_fresh(user.id, "await_role_user") or \
+            await state.get_fresh(user.id, "await_bio", False) or \
+            await state.get_fresh(user.id, "await_profile_photo", False):
+        if msg.text.strip().lower().startswith("/"):
+            # Commands are never treated as answers to a waiting flow.
+            await state.clear(user.id)
+            return
+
+    if await state.pop_fresh(user.id, "await_bio", False):
         await db.execute("UPDATE users SET bio=%s WHERE user_id=%s", (msg.text[:160], user.id))
         await msg.reply_text("بیو ذخیره شد.")
         return
-    if await state.pop(user.id, "await_media_delete", False):
+    if await state.pop_fresh(user.id, "await_media_delete", False):
         row = await db.fetchone("SELECT role FROM users WHERE user_id=%s", (user.id,))
         if user.id != OWNER_ID and (not row or row[0] != "Admin"):
             await msg.reply_text("اجازه حذف محتوا نداری.")
             return
         raw_mid = msg.text.strip()
         if not raw_mid.isdigit():
-            await msg.reply_text("شناسه محتوا باید عددی باشد. دوباره شناسه را بفرست.")
-            await state.set(user.id, "await_media_delete", True)
+            await msg.reply_text("شناسه محتوا باید عددی باشد. دوباره شناسه را بفرست یا /cancel بزن برای خارج شدن.")
             return
         mid = int(raw_mid)
         exists = await db.fetchone("SELECT id FROM media WHERE id=%s", (mid,))
@@ -1036,8 +1054,30 @@ def admin_panel_keyboard(is_owner):
              btn("حذف VIP", "role:remove:VIP", "delete", "danger")],
         ])
     rows.append([btn("حذف محتوا از آرشیو", "media:delete", "delete", "danger")])
+    rows.append([btn("لغو عملیات", "cancel:waiting", "back")])
     rows.append([btn("برگشت", "menu:home", "back")])
     return InlineKeyboardMarkup(rows)
+
+
+async def cancel_waiting_command(update, context):
+    """/cancel — leave any active waiting flow and clear its state."""
+    user = update.effective_user
+    if not user:
+        return
+    await state.clear(user.id)
+    await update.effective_message.reply_text("عملیات لغو شد؛ وضعیت منتظره پاک شد.")
+
+
+async def cancel_waiting_callback(update, context):
+    """Inline "لغو عملیات" button — same as /cancel for waiting flows."""
+    q = update.callback_query
+    await q.answer()
+    await state.clear(q.from_user.id)
+    await edit_callback_message(
+        q,
+        f"{e('admin')} <b>پنل مدیریت i3l.exe</b>\n\nعملیات لغو شد؛ وضعیت منتظره پاک شد.",
+        admin_panel_keyboard(q.from_user.id == OWNER_ID),
+    )
 
 
 async def admin_panel_callback(update, context):
@@ -1061,11 +1101,11 @@ async def role_action_callback(update, context):
         await q.answer("فقط سازنده به این بخش دسترسی دارد.", show_alert=True)
         return
     _, action, role = q.data.split(":")
-    await state.set(q.from_user.id, "await_role_user", {"action": action, "role": role})
+    await state.set_pending(q.from_user.id, "await_role_user", {"action": action, "role": role})
     await q.answer()
     await edit_callback_message(
         q,
-        f"یوزرنیم با @ یا آیدی عددی کاربر را بفرست تا {'به' if action == 'add' else 'از او'} مقام <b>{role}</b> {'داده شود' if action == 'add' else 'گرفته شود'}.",
+        f"یوزرنیم با @ یا آیدی عددی کاربر را بفرست تا {'به' if action == 'add' else 'از او'} مقام <b>{role}</b> {'داده شود' if action == 'add' else 'گرفته شود'}. برای لغو /cancel بزن.",
         InlineKeyboardMarkup([[btn("لغو", "admin:panel", "back")]]),
     )
 
@@ -1076,11 +1116,12 @@ async def media_delete_callback(update, context):
     if q.from_user.id != OWNER_ID and (not row or row[0] != "Admin"):
         await q.answer("اجازه حذف محتوا نداری.", show_alert=True)
         return
-    await state.set(q.from_user.id, "await_media_delete", True)
+    # set_pending clears other waiting states so flows stay mutually exclusive.
+    await state.set_pending(q.from_user.id, "await_media_delete", True)
     await q.answer()
     await edit_callback_message(
         q,
-        "شناسه عددی محتوایی که می‌خواهی از آرشیو حذف کنی بفرست. شناسه محتوا در بخش برترین محتوا هم نمایش داده می‌شود.",
+        "شناسه عددی محتوایی که می‌خواهی از آرشیو حذف کنی بفرست. شناسه محتوا در بخش برترین محتوا هم نمایش داده می‌شود. هر پیام غیرمربوطه یا /cancel این وضعیت را خالي می‌کنه.",
         InlineKeyboardMarkup([[btn("لغو", "admin:panel", "back")]]),
     )
 

@@ -27,7 +27,7 @@ from telegram import Update
 from bot import config
 from bot.db import DatabaseError
 from bot.runtime import ensure_ready
-from bot.telegram_app import build_application
+from bot.telegram_app import bot_commands, build_application
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("i3lexebot.webhook")
@@ -58,7 +58,20 @@ async def get_application():
                 settings.validate_runtime()
                 _application = build_application()
                 await _application.initialize()
+                await _sync_bot_commands(_application)
     return _application
+
+
+async def _sync_bot_commands(application) -> None:
+    """Publish the command list so typing '/' shows command suggestions.
+
+    A failure here must never break webhook serving — the bot keeps working
+    even if Telegram rejects the command list.
+    """
+    try:
+        await application.bot.set_my_commands(bot_commands())
+    except Exception as exc:
+        logger.warning("Could not sync bot commands: %s", exc)
 
 
 async def _process(body: dict) -> None:

@@ -339,15 +339,15 @@ def test_9_upload_confirms_to_sender_and_sends_review_to_admin_group(database, m
     assert row[3] == 999
 
 
-def test_10_no_review_group_keeps_pending_and_confirms_sender(database, monkeypatch):
-    """Without a configured review group the sender still gets the star
-    confirmation; the content stays pending and no review content is sent to
-    any admin DM (only a setup warning to the owner)."""
-    sent = []
-    owner_dms = []
+def test_10_default_review_group_used_until_changed(database, monkeypatch):
+    """With no setting stored, the built-in default review group is used and
+    the review is posted there (the setting only overrides the default)."""
+    from bot.handlers import DEFAULT_REVIEW_GROUP_ID
+
+    sent = {}
 
     async def _send_media(chat_id, file_id, kind, caption, markup, context):
-        sent.append(chat_id)
+        sent["chat_id"] = chat_id
         return SimpleNamespace(message_id=999)
 
     monkeypatch.setattr("bot.handlers.send_media", _send_media)
@@ -359,11 +359,7 @@ def test_10_no_review_group_keeps_pending_and_confirms_sender(database, monkeypa
         )
 
     asyncio.run(_clear_group())
-
-    async def _owner_dm(user_id, text, **kwargs):
-        owner_dms.append((user_id, text))
-
-    context = SimpleNamespace(bot=SimpleNamespace(send_message=_owner_dm))
+    assert DEFAULT_REVIEW_GROUP_ID == -1005871054118
 
     replies = []
 
@@ -372,7 +368,7 @@ def test_10_no_review_group_keeps_pending_and_confirms_sender(database, monkeypa
 
     msg = SimpleNamespace(
         video=None, audio=None, document=None,
-        photo=[SimpleNamespace(file_id="pid-fallback")],
+        photo=[SimpleNamespace(file_id="pid-default")],
         reply_text=_reply_text,
         chat_id=USER,
         chat=SimpleNamespace(id=USER, chat_id=USER, type="private", title=""),
@@ -384,21 +380,129 @@ def test_10_no_review_group_keeps_pending_and_confirms_sender(database, monkeypa
         effective_user=SimpleNamespace(id=USER, username="u", first_name="U"),
     )
 
-    asyncio.run(receive_media(update, context))
+    asyncio.run(receive_media(update, None))
 
     assert any("⭐ محتوای شما برای تأیید ارسال شد" in r for r in replies)
-    assert sent == []  # nothing was posted anywhere
-    # Only a config warning goes to the owner — never the review content.
-    assert owner_dms and owner_dms[0][0] == OWNER
-    assert "در انتظار بررسی" in owner_dms[0][1]
+    assert sent.get("chat_id") == DEFAULT_REVIEW_GROUP_ID
 
     async def _check():
         row = await database.fetchone(
-            "SELECT approved, review_status FROM media WHERE file_id='pid-fallback'"
+            "SELECT approved, review_status FROM media WHERE file_id='pid-default'"
         )
         return row
 
     assert asyncio.run(_check()) == (0, "pending")
+
+
+def test_11_owner_upload_also_requires_review(database, monkeypatch):
+    """Even the owner's upload is NOT auto-approved: it stays pending, the
+    sender gets the star confirmation, and the review goes to the group."""
+    sent = {}
+
+    async def _send_media(chat_id, file_id, kind, caption, markup, context):
+        sent["chat_id"] = chat_id
+        return SimpleNamespace(message_id=999)
+
+    monkeypatch.setattr("bot.handlers.send_media", _send_media)
+
+    replies = []
+
+    async def _reply_text(text, **kwargs):
+        replies.append(text)
+
+    msg = SimpleNamespace(
+        video=None, audio=None, document=None,
+        photo=[SimpleNamespace(file_id="pid-owner")],
+        reply_text=_reply_text,
+        chat_id=OWNER,
+        chat=SimpleNamespace(id=OWNER, chat_id=OWNER, type="private", title=""),
+        text=None,
+    )
+    update = SimpleNamespace(
+        message=msg,
+        effective_message=msg,
+        effective_user=SimpleNamespace(id=OWNER, username="owner", first_name="O"),
+    )
+
+    asyncio.run(receive_media(update, None))
+
+    assert any("⭐ محتوای شما برای تأیید ارسال شد" in r for r in replies)
+    assert not any("آرشیو" in r for r in replies)  # never "ذخیره شد و وارد آرشیو شد"
+    assert sent.get("chat_id") is not None  # review was still sent out
+
+    async def _check():
+        row = await database.fetchone(
+            "SELECT approved, review_status FROM media WHERE file_id='pid-owner'"
+        )
+        return row
+
+    assert asyncio.run(_check()) == (0, "pending")
+
+
+def test_12_owner_panel_review_group_button_sets_group(database, monkeypatch):
+    """The owner-panel 'گروه بررسی' button arms a wait; a numeric group ID
+    saves the setting, non-numeric input gives guidance and exits the wait."""
+    from bot.handlers import review_group_callback
+
+    edits = []
+
+    async def _edit(text, **kwargs):
+        edits.append(text)
+
+    q = SimpleNamespace(
+        from_user=SimpleNamespace(id=OWNER, username="owner", first_name="O"),
+        answer=_noop_answer,
+        message=SimpleNamespace(
+            photo=None, video=None, audio=None, document=None,
+            edit_message_text=_edit, edit_message_caption=_edit,
+        ),
+        edit_message_text=_edit,
+        edit_message_caption=_edit,
+    )
+    update = SimpleNamespace(callback_query=q)
+    asyncio.run(review_group_callback(update, None))
+
+    store = StateStore(database)
+    assert asyncio.run(store.get(OWNER, "await_review_group", False)) is True
+    assert any("همین‌حالا گروه بررسی" in t for t in edits)
+
+    # Numeric input saves the setting.
+    update2, replies2 = _msg("-1001234567890", user_id=OWNER)
+    asyncio.run(text_router(update2, None))
+    assert any("گروه بررسی جدید تنظیم شد" in r for r in replies2)
+
+    async def _check():
+        row = await database.fetchone(
+            "SELECT setting_value FROM bot_settings WHERE setting_key='review_group_id'"
+        )
+        return row
+
+    assert asyncio.run(_check()) == ("-1001234567890",)
+
+    # Non-numeric input: guidance once, wait state consumed (no trap).
+    asyncio.run(review_group_callback(update, None))
+    update3, replies3 = _msg("نامعلوم", user_id=OWNER)
+    asyncio.run(text_router(update3, None))
+    assert any("شناسه گروه باید عددی باشد" in r for r in replies3)
+    assert asyncio.run(store.get(OWNER, "await_review_group", False)) is False
+
+
+async def _noop_answer(**kwargs):
+    return None
+
+
+def test_13_bot_commands_published_for_slash_suggestions():
+    """The command list published via set_my_commands covers the bot's
+    commands, so typing '/' shows them as suggestions."""
+    from bot.telegram_app import bot_commands
+
+    commands = {c.command for c in bot_commands()}
+    for expected in ("start", "help", "profile", "cancel", "manage",
+                     "setreviewgroup", "restoremedia"):
+        assert expected in commands, expected
+    # Every command needs a non-empty description.
+    for c in bot_commands():
+        assert c.description
 
 
 def test_default_ttl_is_ten_minutes():

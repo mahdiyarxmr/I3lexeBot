@@ -8,6 +8,7 @@ webhook runtime instead of being driven by a polling loop.
 
 from __future__ import annotations
 
+from telegram import BotCommand
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -18,6 +19,20 @@ from telegram.ext import (
 
 from . import handlers as H
 from .runtime import settings
+
+
+def bot_commands():
+    """The bot's command list, published via set_my_commands so that typing
+    '/' in a chat shows the command suggestions."""
+    return [
+        BotCommand("start", "شروع بات و راهنمای اولیه"),
+        BotCommand("help", "راهنمای کامل دستورات و قابلیت‌ها"),
+        BotCommand("profile", "مشاهده پروفایل (برای دیگران روی پیامشان ریپلای کن)"),
+        BotCommand("cancel", "لغو عملیات در حال انتظار"),
+        BotCommand("manage", "پنل مدیریت (فقط سازنده و ادمین)"),
+        BotCommand("setreviewgroup", "تنظیم گروه بررسی (فقط Owner، داخل گروه مدیریت)"),
+        BotCommand("restoremedia", "بازگرداندن محتوا حذف‌شده به آرشیو (فقط Owner)"),
+    ]
 
 
 def build_application() -> Application:
@@ -61,6 +76,7 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(H.role_action_callback, pattern=r"^role:"))
     app.add_handler(CallbackQueryHandler(H.media_delete_callback, pattern=r"^media:delete$"))
     app.add_handler(CallbackQueryHandler(H.cancel_waiting_callback, pattern=r"^cancel:waiting$"))
+    app.add_handler(CallbackQueryHandler(H.review_group_callback, pattern=r"^admin:reviewgroup$"))
     app.add_handler(CallbackQueryHandler(H.menu_callback, pattern=r"^(menu:|rank:|top:|profile:|color:)"))
 
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, H.welcome))

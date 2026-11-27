@@ -219,11 +219,16 @@ async def media_rate_limited(user_id):
     return not await rate_limiter.allow(user_id, "media", 10, 120)
 
 
+# Default review (admins) group, used until the owner changes it via the
+# admin panel or /setreviewgroup.
+DEFAULT_REVIEW_GROUP_ID = -1005871054118
+
+
 async def get_review_group_id():
     row = await db.fetchone(
         "SELECT setting_value FROM bot_settings WHERE setting_key='review_group_id'"
     )
-    return int(row[0]) if row else None
+    return int(row[0]) if row else DEFAULT_REVIEW_GROUP_ID
 
 
 # ---------------------------------------------------------------------------
@@ -297,14 +302,10 @@ async def receive_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("محدودیت ضداسپم: حداکثر ۱۰ محتوا در هر ۲ دقیقه مجاز است. کمی صبر کن و دوباره بفرست.")
         return
 
-    approved = 1 if user.id == OWNER_ID else 0
-    media_id = await save_media(file_id, kind, user, approved)
-    if approved:
-        await msg.reply_text(f"{e('approve')} ذخیره شد و وارد آرشیو شد.", parse_mode=ParseMode.HTML)
-        return
-
-    # The sender only gets a confirmation; the content itself is held back
-    # until an admin approves it in the review group.
+    # Every upload — including the owner's or an admin's — goes through
+    # review: nothing is archived until an admin approves it in the review
+    # group. The sender only gets the star confirmation.
+    media_id = await save_media(file_id, kind, user, 0)
     await msg.reply_text("⭐ محتوای شما برای تأیید ارسال شد.")
 
     # The review request always goes to the configured review group — never
@@ -861,11 +862,33 @@ async def text_router(update, context):
     if await state.get_fresh(user.id, "await_media_delete", False) or \
             await state.get_fresh(user.id, "await_role_user") or \
             await state.get_fresh(user.id, "await_bio", False) or \
-            await state.get_fresh(user.id, "await_profile_photo", False):
+            await state.get_fresh(user.id, "await_profile_photo", False) or \
+            await state.get_fresh(user.id, "await_review_group", False):
         if msg.text.strip().lower().startswith("/"):
             # Commands are never treated as answers to a waiting flow.
             await state.clear(user.id)
             return
+
+    if await state.pop_fresh(user.id, "await_review_group", False):
+        if user.id != OWNER_ID:
+            await msg.reply_text("فقط Owner می‌تواند گروه بررسی را تغییر دهد.")
+            return
+        raw_gid = msg.text.strip()
+        if not (raw_gid.lstrip("-").isdigit() and raw_gid.count("-") <= 1):
+            await msg.reply_text("شناسه گروه باید عددی باشد. دوباره شناسه عددی گروه را بفرست.")
+            return
+        gid = int(raw_gid)
+        await db.execute(
+            "INSERT INTO bot_settings(setting_key,setting_value) VALUES('review_group_id',%s) "
+            "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
+            (str(gid),),
+        )
+        await msg.reply_text(
+            f"گروه بررسی جدید تنظیم شد: <code>{gid}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_panel_keyboard(user.id == OWNER_ID),
+        )
+        return
 
     if await state.pop_fresh(user.id, "await_bio", False):
         await db.execute("UPDATE users SET bio=%s WHERE user_id=%s", (msg.text[:160], user.id))
@@ -1050,6 +1073,7 @@ def admin_panel_keyboard(is_owner):
              btn("حذف Admin", "role:remove:Admin", "delete", "danger")],
             [btn("افزودن VIP", "role:add:VIP", "vip", "success"),
              btn("حذف VIP", "role:remove:VIP", "delete", "danger")],
+            [btn("گروه بررسی", "admin:reviewgroup", "admin", "success")],
         ])
     rows.append([btn("حذف محتوا از آرشیو", "media:delete", "delete", "danger")])
     rows.append([btn("لغو عملیات", "cancel:waiting", "back")])
@@ -1075,6 +1099,23 @@ async def cancel_waiting_callback(update, context):
         q,
         f"{e('admin')} <b>پنل مدیریت i3l.exe</b>\n\nعملیات لغو شد؛ وضعیت منتظره پاک شد.",
         admin_panel_keyboard(q.from_user.id == OWNER_ID),
+    )
+
+
+async def review_group_callback(update, context):
+    """Owner-panel 'گروه بررسی' button — prompts for the review group ID."""
+    q = update.callback_query
+    if q.from_user.id != OWNER_ID:
+        await q.answer("فقط سازنده به این بخش دسترسی دارد.", show_alert=True)
+        return
+    current = await get_review_group_id()
+    await state.set_pending(q.from_user.id, "await_review_group", True)
+    await q.answer()
+    await edit_callback_message(
+        q,
+        f"همین‌حالا گروه بررسی: <code>{current}</code>\n"
+        "شناسه عددی گروه مقصد (گروه ادمین‌ها) را بفرست تا تغییر کند. هر پیام غیرعددی این وضعیت را خالی می‌کند.",
+        InlineKeyboardMarkup([[btn("لغو", "admin:panel", "back")]]),
     )
 
 

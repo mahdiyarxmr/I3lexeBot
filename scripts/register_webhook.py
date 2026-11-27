@@ -77,14 +77,19 @@ async def _check(settings: config.Config) -> int:
     if info is None:
         print("Telegram did not return webhook info.")
         return 1
-    url = info.url or "(none)"
+
+    # Read every field defensively. PTB's WebhookInfo does not guarantee that
+    # every optional attribute exists across versions (e.g.
+    # ``certificate_fingerprint`` is not present in PTB 22.x), so a missing
+    # attribute must never crash the check.
+    url = getattr(info, "url", "") or "(none)"
     print(f"Webhook URL          : {url}")
-    print(f"Pending updates      : {info.pending_update_count}")
-    print(f"Last error date      : {info.last_error_date or '(none)'}")
-    print(f"Last error message   : {info.last_error_message or '(none)'}")
-    print(f"Allowed updates      : {info.allowed_updates or '(all)'}")
-    print(f"IP address           : {info.ip_address or '(none)'}")
-    print(f"Certificate fingerprint: {info.certificate_fingerprint or '(none)'}")
+    print(f"Pending updates      : {getattr(info, 'pending_update_count', 0)}")
+    print(f"Last error date      : {getattr(info, 'last_error_date', None) or '(none)'}")
+    print(f"Last error message   : {getattr(info, 'last_error_message', None) or '(none)'}")
+    print(f"Allowed updates      : {getattr(info, 'allowed_updates', None) or '(all)'}")
+    print(f"IP address           : {getattr(info, 'ip_address', None) or '(none)'}")
+    print(f"Certificate fingerprint: {getattr(info, 'certificate_fingerprint', None) or '(none)'}")
     expected = settings.webhook_url.rstrip("/")
     if url == "(none)":
         print("Status: NOT registered — run `python scripts/register_webhook.py` to register.")

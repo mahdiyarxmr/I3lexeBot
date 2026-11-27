@@ -1,0 +1,70 @@
+name: Register Telegram Webhook
+
+# Manual-only: never runs automatically on push/PR. Registration is a
+# deliberate, one-time action against Telegram, so it must be triggered by
+# hand with the correct secrets in place.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Defence in depth: mask the secrets in the logs even though the
+      # register_webhook.py script never prints them.
+      - name: Mask secrets
+        run: |
+          echo "::add-mask::${{ secrets.BOT_TOKEN }}"
+          echo "::add-mask::${{ secrets.WEBHOOK_SECRET }}"
+
+      - name: Validate configuration
+        # Refuses to proceed unless BOT_TOKEN, WEBHOOK_SECRET and WEBHOOK_URL
+        # are present and WEBHOOK_URL points at /api/webhook. Prints only the
+        # URL and whether the secret is set — never the secret itself.
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: python scripts/register_webhook.py --dry-run
+
+      - name: Register webhook (setWebhook)
+        # Calls Telegram setWebhook with:
+        #   url             = WEBHOOK_URL (https://kiramartin.vercel.app/api/webhook)
+        #   secret_token    = WEBHOOK_SECRET
+        #   allowed_updates = ["message", "callback_query"]
+        #   drop_pending_updates = False   (pending updates are preserved)
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: python scripts/register_webhook.py
+
+      - name: Verify registration (getWebhookInfo)
+        # Reads back the webhook state and confirms the URL matches the
+        # expected one. Read-only: changes nothing, drops nothing.
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: python scripts/register_webhook.py --check

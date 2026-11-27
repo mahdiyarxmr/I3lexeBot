@@ -11,9 +11,12 @@ Usage
 -----
     export BOT_TOKEN="123456:ABC..."
     export OWNER_ID="6341879634"
-    export WEBHOOK_URL="https://i3lexebot.vercel.app/api/webhook"
+    export WEBHOOK_URL="https://kiramartin.vercel.app/api/webhook"
     export WEBHOOK_SECRET="a-long-random-string"
     python scripts/register_webhook.py
+
+    # Report the current webhook state (getWebhookInfo, read-only):
+    python scripts/register_webhook.py --check
 
     # Remove the webhook (returns the bot to polling-free, webhook-off state):
     python scripts/register_webhook.py --unset
@@ -63,10 +66,44 @@ async def _unset(settings: config.Config) -> int:
     return 0 if result else 1
 
 
+async def _check(settings: config.Config) -> int:
+    """Report the current webhook state via getWebhookInfo (read-only).
+
+    Never prints the bot token or the webhook secret. Pending update counts
+    are reported as-is; this call never drops or modifies anything.
+    """
+    bot = Bot(token=settings.bot_token)
+    info = await bot.get_webhook_info()
+    if info is None:
+        print("Telegram did not return webhook info.")
+        return 1
+    url = info.url or "(none)"
+    print(f"Webhook URL          : {url}")
+    print(f"Pending updates      : {info.pending_update_count}")
+    print(f"Last error date      : {info.last_error_date or '(none)'}")
+    print(f"Last error message   : {info.last_error_message or '(none)'}")
+    print(f"Allowed updates      : {info.allowed_updates or '(all)'}")
+    print(f"IP address           : {info.ip_address or '(none)'}")
+    print(f"Certificate fingerprint: {info.certificate_fingerprint or '(none)'}")
+    expected = settings.webhook_url.rstrip("/")
+    if url == "(none)":
+        print("Status: NOT registered — run `python scripts/register_webhook.py` to register.")
+        return 1
+    if url.rstrip("/") == expected:
+        print(f"Status: registered at the expected URL ({expected}).")
+        return 0
+    print(f"Status: registered at a DIFFERENT URL than WEBHOOK_URL.")
+    print(f"  expected : {expected}")
+    print(f"  actual   : {url}")
+    return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--unset", action="store_true",
                         help="Delete the webhook instead of registering it.")
+    parser.add_argument("--check", action="store_true",
+                        help="Report the current webhook state (getWebhookInfo, read-only).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate configuration without calling Telegram.")
     args = parser.parse_args()
@@ -83,6 +120,9 @@ def main() -> int:
         print(f"  WEBHOOK_URL     : {settings.webhook_url}")
         print(f"  WEBHOOK_SECRET  : {'<set>' if settings.webhook_secret else '<missing>'}")
         return 0
+
+    if args.check:
+        return asyncio.run(_check(settings))
 
     if args.unset:
         return asyncio.run(_unset(settings))

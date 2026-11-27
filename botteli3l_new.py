@@ -13,8 +13,8 @@ address, then run ``scripts/register_webhook.py``.
 
 Usage:
     pip install -r requirements.txt
-    python main.py                 # serves http://0.0.0.0:8000
-    PORT=3000 python main.py
+    python botteli3l_new.py        # serves http://0.0.0.0:8000
+    PORT=3000 python botteli3l_new.py
 """
 
 from __future__ import annotations

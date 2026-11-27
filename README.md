@@ -29,11 +29,10 @@ preserved.
 | `bot/config.py` | Environment configuration + validation. |
 | `bot/ui.py` | Premium emoji + inline keyboard helpers (unchanged). |
 | `bot/runtime.py` | Lazily-initialised runtime singletons. |
-| `main.py` | **Local development launcher** (runs the webhook app with uvicorn; no polling). |
+| `botteli3l_new.py` | **Local development launcher** (runs the webhook app with uvicorn; no polling). |
 | `scripts/migrate_sqlite_to_postgres.py` | Safe SQLite → PostgreSQL import utility. |
 | `scripts/register_webhook.py` | Registers/clears the Telegram webhook. |
 | `requirements.txt` | Python dependencies (Vercel auto-installs). |
-| `vercel.json` | Vercel function/runtime configuration. |
 
 ## Environment variables
 
@@ -59,8 +58,9 @@ A template is provided in [`.env.example`](.env.example).
 2. Add the environment variables above in **Project → Settings → Environment
    Variables** (production, and development if you use it).
 3. Deploy. No build command is required — Vercel detects `requirements.txt`
-   and installs dependencies automatically. `vercel.json` pins the Python
-   runtime (`python3.11`) and maps `api/**` to the serverless function.
+   and installs dependencies automatically, and serves `api/webhook.py` as a
+   serverless function using **native Python runtime detection** (no
+   `vercel.json` runtime override is needed or present).
 4. The function is served at:
 
    ```
@@ -69,18 +69,6 @@ A template is provided in [`.env.example`](.env.example).
 
    Vercel recognises the ASGI `app` object exported by `api/webhook.py`
    (re-exported from `app.py`).
-
-`vercel.json`:
-
-```json
-{
-  "functions": {
-    "api/**": {
-      "runtime": "python3.11"
-    }
-  }
-}
-```
 
 ## Database migration (SQLite → PostgreSQL)
 
@@ -159,7 +147,7 @@ responses.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # fill in real values
-python main.py                # serves http://0.0.0.0:8000
+python botteli3l_new.py       # serves http://0.0.0.0:8000
 ```
 
 Local mode runs the **webhook** server, not polling. Expose it with a tunnel
@@ -169,7 +157,7 @@ address, and register the webhook.
 ## Tests / checks
 
 ```bash
-python -m py_compile app.py main.py bot/*.py scripts/*.py api/*.py
+python -m py_compile app.py botteli3l_new.py bot/*.py scripts/*.py api/*.py
 python -m pytest tests/ -q
 ```
 
